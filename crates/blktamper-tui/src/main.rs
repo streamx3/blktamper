@@ -31,9 +31,15 @@ use std::time::Duration;
                   opens the write handle; committing needs the device name typed. \
                   Nothing is written before all three."
 )]
+#[command(disable_version_flag = true)]
 struct Cli {
     /// Block device or image file, e.g. /dev/sdc or disk.img
-    device: PathBuf,
+    device: Option<PathBuf>,
+
+    /// Print the version, the formats this build understands, and whether it can
+    /// write. A bare version number is not much use in a bug report about a disk.
+    #[arg(short = 'v', long)]
+    version: bool,
 
     /// Override the logical sector size. Needed for images taken from 4Kn disks,
     /// where every LBA is otherwise 8x wrong.
@@ -59,8 +65,57 @@ struct Cli {
     rw: bool,
 }
 
+/// What this build is, in the form a bug report needs.
+///
+/// The format list and the write capability are both compile-time choices, so a
+/// report that says only "0.1.2" leaves the two most useful questions unanswered:
+/// which parsers were present, and could it have written anything.
+fn version_text() -> String {
+    // The format features belong to blktamper-formats, so ask the registry what is
+    // actually compiled in rather than restating a cfg list that can drift.
+    let enabled: Vec<String> = blktamper_formats::registry()
+        .probes()
+        .iter()
+        .map(|p| p.id().0.to_string())
+        .collect();
+
+    format!(
+        "{name} {ver}\n\
+         formats:   {fmts}\n\
+         write:     {write}\n\
+         clipboard: {clip}\n\
+         platform:  {os} {arch}\n\
+         \n\
+         {repo}",
+        // The binary is `blktamper`; CARGO_PKG_NAME is the package, `blktamper-tui`.
+        name = "blktamper",
+        ver = env!("CARGO_PKG_VERSION"),
+        fmts = if enabled.is_empty() { "(none)".to_string() } else { enabled.join(", ") },
+        write = "supported behind --rw, :arm and :commit",
+        clip = if cfg!(feature = "clipboard") {
+            "native + OSC 52"
+        } else {
+            "OSC 52 only (built without the clipboard feature)"
+        },
+        os = std::env::consts::OS,
+        arch = std::env::consts::ARCH,
+        repo = env!("CARGO_PKG_REPOSITORY"),
+    )
+}
+
 fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    if cli.version {
+        println!("{}", version_text());
+        return Ok(());
+    }
+
+    let Some(device) = cli.device.clone() else {
+        anyhow::bail!(
+            "no device given.\n\nUsage: blktamper <DEVICE>   (try --help, or --version)"
+        );
+    };
 
     if let Some(s) = cli.sector_size {
         if !s.is_power_of_two() || !(512..=65536).contains(&s) {
@@ -68,7 +123,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let session = match Session::open(&cli.device, cli.sector_size, cli.rw) {
+    let session = match Session::open(&device, cli.sector_size, cli.rw) {
         Ok(s) => s,
         Err(e) => {
             // The advice is the point; print it plainly rather than through a
@@ -239,6 +294,20 @@ mod tests {
 
     fn key(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::empty())
+    }
+
+    #[test]
+    fn version_says_what_the_build_can_actually_do() {
+        let v = version_text();
+        assert!(v.starts_with("blktamper "), "must name the binary, not the package: {v}");
+        assert!(v.contains(env!("CARGO_PKG_VERSION")));
+        // The two facts a bug report about a disk actually needs.
+        assert!(v.contains("formats:"), "{v}");
+        assert!(v.contains("write:"), "{v}");
+        // The format list comes from the registry, so it cannot drift from the build.
+        for f in ["mbr", "gpt", "fat", "exfat"] {
+            assert!(v.contains(f), "format {f} missing from version output: {v}");
+        }
     }
 
     #[test]

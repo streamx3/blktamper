@@ -16,6 +16,7 @@ about what is actually on the disk — including when what's there is garbage.
 | [07-write-safety.md](07-write-safety.md) | Linux block I/O reality. Overlay, undo journal, arming. |
 | [08-roadmap.md](08-roadmap.md) | Milestones with exit criteria. |
 | [09-open-questions.md](09-open-questions.md) | Things I need you to decide. |
+| [10-other-platforms.md](10-other-platforms.md) | Can this work on macOS and Windows? Interfaces, permissions, and what breaks. |
 
 ## The one-paragraph version
 

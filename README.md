@@ -33,6 +33,9 @@ On a real device you will need privileges, because `/dev/sd*` is `root:disk 0660
 sudo blktamper /dev/sdc
 ```
 
+`blktamper -v` reports the version, which formats the build understands and whether
+it can write — the things a bug report about a disk actually needs.
+
 There is also a non-interactive mode, useful in scripts and bug reports:
 
 ```bash

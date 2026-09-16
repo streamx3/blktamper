@@ -6,6 +6,16 @@ Compaction, and the end of trusting filesystem markers about what is still there
 
 ### Added
 
+- **`-v` / `--version`.** Reports the version, the formats the build actually
+  understands (asked of the registry, so it cannot drift from the cfg flags), whether
+  it can write, the clipboard support compiled in, and the platform. A bare version
+  number answers none of the questions a disk bug report needs.
+- **[doc/10-other-platforms.md](doc/10-other-platforms.md)** — research on whether
+  macOS and Windows permit this at all. Short answer: yes, both, with documented
+  interfaces; Windows is the stricter of the two and names partitioning and recovery
+  tools as intended users, while macOS leaves the raw node unguarded under a live
+  mount and closes the boot disk to third parties entirely.
+
 - **`compact`, now the default scrub mode.** Removes the deleted records from a
   directory, closes the gap so the survivors stay reachable, and zeroes every byte
   they vacate along with the rest of the directory's allocated space. The only mode

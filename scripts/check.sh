@@ -84,11 +84,48 @@ passed=$(grep -oE 'test result: ok\. [0-9]+' <<<"$out" | awk '{s+=$4} END {print
 failed=$(grep -cE '^test result: FAILED' <<<"$out")
 if [ "$failed" -eq 0 ]; then ok "$passed tests passed"; else bad "$failed test binaries failed"; grep -E '^---- |panicked at' <<<"$out" | head -20; fi
 
-step "read-only guarantee"
-if grep -rnE '\bwrite_at\b|OpenOptions::new\(\)[^;]*\.write\(true\)|\.create\(true\)' crates/blktamper-io/src | grep -v '^\s*//'; then
-  bad "blktamper-io has grown a write path; doc/07-write-safety.md must be honoured first"
+step "write gates (ADR-007)"
+# The build can write now, so the invariant is no longer "there is no write path" --
+# it is "every write goes through the three gates". These greps are how that stays
+# true; each one caught something real while the feature was being built.
+
+# 1. Only one place opens the device for writing, and it is the arm step.
+n=$(grep -rn 'open_rw' crates/ --include='*.rs' | grep -v 'crates/blktamper-io/src/file.rs'     | grep -v '#\[cfg(test)\]' | grep -vc 'tests/' || true)
+callers=$(grep -rln 'open_rw' crates/*/src --include='*.rs' | grep -v 'blktamper-io/src/file.rs' || true)
+if [ "$(echo "$callers" | grep -c . )" -le 1 ]; then
+  ok "the write handle is opened in one place${callers:+ ($callers)}"
 else
-  ok "blktamper-io still has no write path"
+  bad "more than one place opens the device for writing:"; echo "$callers"
+fi
+
+# 2. That place checks --rw first.
+if grep -A6 'pub fn arm' crates/blktamper-tui/src/session.rs | grep -q 'write.permitted'; then
+  ok "arming checks that --rw was passed"
+else
+  bad "Session::arm does not check the --rw permission"
+fi
+
+# 3. Nothing reaches the device except through the overlay's commit.
+strays=$(grep -rn '\.write_at(' crates/*/src --include='*.rs'          | grep -v 'blktamper-io/src/file.rs' | grep -v 'blktamper-io/src/overlay.rs'          | grep -v 'blktamper-core/src/source.rs' || true)
+if [ -z "$strays" ]; then
+  ok "all writes go through the overlay"
+else
+  bad "a write bypasses the overlay:"; echo "$strays"
+fi
+
+# 4. Reading still opens read-only.
+if grep -q 'Access::ReadOnly' crates/blktamper-tui/src/session.rs; then
+  ok "the read path still opens O_RDONLY"
+else
+  bad "the read path no longer opens read-only"
+fi
+
+# 5. The journal is written before the device is.
+if awk '/pub fn commit/,/^    }/' crates/blktamper-tui/src/session.rs \
+     | grep -n 'journal.append\|overlay$' | head -2 | grep -q 'journal.append'; then
+  ok "the journal is appended before the commit"
+else
+  bad "commit may touch the device before journalling"
 fi
 
 printf '\n'

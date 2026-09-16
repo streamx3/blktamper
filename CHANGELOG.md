@@ -1,20 +1,44 @@
 # Changelog
 
+## 0.1.3
+
+Portability research and a version flag. No behaviour change on Linux.
+
+### Added
+
+- **`-v` / `--version`.** Reports the version, the formats the build actually
+  understands, whether it can write, the clipboard support compiled in, and the
+  platform. The format list is asked of the registry rather than restated from cfg
+  flags, so it cannot drift from what is really compiled in. A bare version number
+  answers none of the questions a bug report about a disk needs.
+- **[doc/10-other-platforms.md](doc/10-other-platforms.md)** — can this work on macOS
+  and Windows? Researched against vendor documentation and, for macOS, against XNU and
+  IOStorageFamily source.
+
+  Both platforms document complete, supported interfaces and neither panics from
+  userspace raw writes. Windows is the stricter of the two and unusually explicit:
+  partition-table sectors stay writable on a mounted disk because *"there is no reason
+  to block access to the sectors"*, and recovery programs are named as unaffected.
+  macOS is the permissive one — its block node returns `EBUSY` when mounted even for
+  `O_RDONLY`, while the raw node opened `O_RDWR` under a live read-write mount simply
+  succeeds, with no equivalent of `CONFIG_BLK_DEV_WRITE_MOUNTED`.
+
+  The real hazard on both is not a crash but the OS repairing behind you — `chkdsk` on
+  the NTFS dirty bit, `fsck_*` from `diskarbitrationd` — which destroys exactly the
+  residue this tool exists to show. Hard limits: the macOS boot disk is closed to
+  third parties, and the Windows system volume can never be locked.
+
+### Fixed
+
+- The changelog filed the two entries above under 0.1.2, which was already tagged and
+  pushed. They belong here.
+
+
 ## 0.1.2
 
 Compaction, and the end of trusting filesystem markers about what is still there.
 
 ### Added
-
-- **`-v` / `--version`.** Reports the version, the formats the build actually
-  understands (asked of the registry, so it cannot drift from the cfg flags), whether
-  it can write, the clipboard support compiled in, and the platform. A bare version
-  number answers none of the questions a disk bug report needs.
-- **[doc/10-other-platforms.md](doc/10-other-platforms.md)** — research on whether
-  macOS and Windows permit this at all. Short answer: yes, both, with documented
-  interfaces; Windows is the stricter of the two and names partitioning and recovery
-  tools as intended users, while macOS leaves the raw node unguarded under a live
-  mount and closes the boot disk to third parties entirely.
 
 - **`compact`, now the default scrub mode.** Removes the deleted records from a
   directory, closes the gap so the survivors stay reachable, and zeroes every byte

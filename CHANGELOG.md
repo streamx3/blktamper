@@ -1,5 +1,53 @@
 # Changelog
 
+## 0.1.2
+
+Compaction, and the end of trusting filesystem markers about what is still there.
+
+### Added
+
+- **`compact`, now the default scrub mode.** Removes the deleted records from a
+  directory, closes the gap so the survivors stay reachable, and zeroes every byte
+  they vacate along with the rest of the directory's allocated space. The only mode
+  that leaves no tombstone — which the stated threat model requires, since a
+  tombstone with a zeroed payload says "a file was deleted and scrubbed here", more
+  than an ordinary deletion would have said.
+- **`sweep`**: blanks every deleted record in place while keeping its marker, then
+  zeroes everything past the last live record. Lower blast radius than `compact` —
+  nothing moves — at the cost of leaving tombstones between live files.
+- Both directory modes also clear records marked never-used whose bytes are not
+  zero: entries overwritten rather than erased.
+
+### Changed
+
+- **Zeroing warns instead of refusing.** The old refusal contradicted R-7.8 and
+  overstated the consequence: hiding records from a driver is not destroying them,
+  their bytes are untouched, and undo restores reachability. The dialog now names the
+  affected files, states the cost, and points out that `compact` does the same job
+  without hiding anything.
+- **The scrub guards no longer stop at the end-of-directory marker.** The listers
+  already walked past it; the code deciding what was safe did not. A record past the
+  terminator is invisible to a driver and just as readable on disk, and the tool
+  should not believe a marker its own viewer pointedly does not.
+- `scrub_plan` takes a `ScrubMode` rather than a `Fill`.
+
+### Fixed
+
+- **A directory-wide mode could have accepted a file's first cluster.** It has the
+  same shape the check looked for — one span, cluster-aligned, one cluster long — and
+  compacting it would have rewritten file data as though it were directory records.
+  Both modules now require the bytes to agree that they are a directory.
+- The affected-record name for a FAT set read a long-filename fragment as text,
+  producing nonsense; it now reads the 8.3 entry.
+
+### Still not included
+
+- **Carving.** Compaction cleans the directories it is pointed at, not deleted
+  directories (whose cluster chain is released) or clusters a directory used before
+  it shrank. Both hold filenames. This is now the limiting factor on the threat model
+  rather than a detail — see [ADR-011](doc/03-decisions.md).
+- Overwriting file contents, and any claim about physical erasure.
+
 ## 0.1.1
 
 Scrubbing recoverable records on FAT32 and exFAT — the first write operation, and

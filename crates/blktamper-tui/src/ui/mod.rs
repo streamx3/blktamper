@@ -65,7 +65,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             detail::draw_interpret(f, area, at, &options, sel)
         }
         Popup::Command { buffer } => draw_command(f, chunks[3], &buffer),
-        Popup::Scrub { plan } => scrub::draw(f, area, app, &plan),
+        Popup::Scrub { plan, .. } => scrub::draw(f, area, app, &plan),
         Popup::Commit { typed } => scrub::draw_commit(f, area, app, &typed),
         Popup::None => {}
     }

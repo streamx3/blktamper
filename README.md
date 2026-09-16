@@ -62,8 +62,10 @@ press `S`:
  Record     deleted-payload.bin (deleted)
             3 record(s), 96 bytes at 0x00001FC840
 
- Fill       (o) neutral   keep the deleted marker, zero the rest
-            ( ) zero      zero every byte; reads as never used
+ Mode       (o) [c] compact remove them, close the gap, zero the tail
+            ( ) [s] sweep   blank every deleted record, zero the tail
+            ( ) [n] neutral keep the deleted marker, zero the rest
+            ( ) [z] zero    zero every byte; reads as never used
 
  Removes    the long filename, held in 2 fragment(s) that survived the
               delete intact
@@ -85,10 +87,13 @@ press `S`:
 
 Three things that dialog is careful about:
 
-- **`zero` is guarded.** `0x00` in a FAT name's first byte, or an exFAT `entry_type`,
-  means *stop scanning* — not *this record is empty*. Zeroing a record ahead of live
-  entries hides them from every driver, so it is offered only when nothing in use
-  follows.
+- **`compact` is the default** because it is the only mode that leaves no tombstone.
+  Survivors move up to close the gap — safe because neither FAT nor exFAT has
+  positional back-references — and every byte they vacate is zeroed.
+- **`zero` warns rather than refuses.** `0x00` in a FAT name's first byte means *stop
+  scanning*, so zeroing ahead of live entries makes the OS stop seeing them. Their
+  records and data are untouched and undo restores them, so the dialog names them and
+  lets you decide.
 - **The set goes together.** A FAT record is its 8.3 entry plus every long-filename
   fragment; exFAT is the file entry plus the stream extension plus every name entry.
   Half a scrub leaves the name recoverable from the other half.

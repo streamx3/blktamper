@@ -526,99 +526,126 @@ Two consequences worth stating plainly:
 
 ---
 
-## ADR-011: Scrubbing deleted records — two fills, no random
+## ADR-011: Scrubbing recoverable records
 
-**Status:** accepted — decided by the author 2026-09-16
+**Status:** accepted 2026-09-16, revised the same day after the threat model was stated
 
-### Decision
+### Threat model
 
-blktamper will be able to overwrite a deleted directory record. Two fills, and
-random is not one of them:
+Stated by the author: **an opponent is a technician at a competitor who gets hold of
+the flash drive, and must not be able to learn business plans even from file names.**
+Explicitly *not* a government, intelligence or military adversary.
 
-| Mode | What it writes | When it is offered |
-|---|---|---|
-| **neutral** | keeps the record's deleted marker, zeroes the other 31 bytes | always — cannot change directory semantics |
-| **zero** | all 32 bytes to `0x00` | only when no in-use record follows in that directory |
+That calibration decides several things below. It is why filenames are the asset, why
+"looks unremarkable" matters as much as "is empty", and why physical erasure is out of
+scope rather than an unmet requirement.
+
+### Modes
+
+Four, in decreasing thoroughness and increasing caution:
+
+| Mode | Scope | What it leaves | Writes |
+|---|---|---|---|
+| **compact** *(default)* | directory | nothing: deleted records removed, survivors closed up, every vacated byte zeroed | the whole directory |
+| **sweep** | directory | tombstones only where they sit between live records; the tail fully zeroed | changed records only |
+| **neutral** | one record set | the deleted marker, payload zeroed | one sector |
+| **zero** | one record set | nothing in that record | one sector |
+
+**`compact` is the default** because it is the only mode that leaves no tombstone at
+all, and a tombstone with a zeroed payload is exactly the "suspicious as hell" state
+the threat model rules out: it says a file was deleted and scrubbed, which is more
+informative to an opponent than an ordinary deletion would have been.
+
+It is feasible because **neither FAT nor exFAT has positional back-references**.
+Nothing points at "record 6 of this directory" — a subdirectory's `..` names the
+parent's *cluster*, and the FAT and allocation bitmap are keyed by cluster. Survivors
+can therefore move. (NTFS would be a different story: MFT references are positional.)
+The order-preserving pack keeps a long-filename run adjacent to its 8.3 entry and an
+exFAT entry set contiguous, and `.`/`..` stay first because they are live and already
+first.
+
+**Everything the survivors vacate is zeroed in full**, not merely marked free. A slot
+marked free whose remaining 31 bytes still hold a name is the residue this exists to
+remove, and both directory modes clear it — including records that were *already*
+marked never-used but not erased.
 
 ### Why random fill was rejected
 
-It was offered and turned down, and the reasoning is worth keeping because it is
-counter-intuitive: **random bytes are more conspicuous than zeros, not less.**
+Offered and turned down. The reasoning is counter-intuitive enough to keep: **random
+bytes are more conspicuous than zeros.** A directory cluster a formatter never used is
+zeros, so noise written into one announces that somebody scrubbed there, while zeros
+are indistinguishable from space that was never allocated. There is also no multi-pass
+argument on 32 bytes inside one sector — one pass either landed or it did not.
 
-A directory cluster that a formatter has never used is zeros. Writing noise into one
-announces that somebody deliberately scrubbed there; writing zeros makes the record
-indistinguishable from space that was never allocated. And there is no multi-pass
-argument to make here — a directory record is 32 bytes inside one sector, and one
-pass either landed or it did not.
+### Zeroing warns, it does not refuse
 
-Random fill also costs a CSPRNG dependency and a class of mistake (seeding a PRNG and
-producing predictable "noise") for no benefit.
+An earlier revision refused `zero` when live records followed. That was wrong twice
+over:
 
-### The guard on `zero`, and why it is not optional
+- It contradicted **R-7.8** — *"The app MUST NOT refuse to write a value it believes
+  is wrong. It warns; the user decides."*
+- It overstated the consequence. `0x00` in a FAT name's first byte, or an exFAT
+  `entry_type`, means *stop scanning*, so zeroing ahead of live entries makes the OS
+  stop seeing them — but their records and their data are byte-for-byte untouched,
+  blktamper still shows them, and undo restores reachability. **Hiding is not
+  destroying**, and the tool may not blur the two.
 
-In FAT, a first name byte of `0x00` does not mean "this record is empty". It means
-**stop scanning — nothing after this point is in use** (`desc::FREE_MARK`, which
-blktamper already renders as an `end of directory` node). exFAT is identical:
-`entry_type == 0x00` is `types::END_OF_DIRECTORY`.
+So the dialog names the affected files, states the consequence, and lets the user
+proceed. It also points out that `compact` achieves the same end without hiding
+anything.
 
-So zeroing a deleted record that sits before live entries makes every one of those
-live files invisible to every driver. A cleanup operation causing data loss is the
-worst failure this program could have, so:
+### Rejected: cascading the zero
 
-- `zero` is offered only when every record after it in that directory is already
-  free. Otherwise the tool refuses and explains, and offers `neutral` instead.
-- When records that follow are *deleted* rather than free, `zero` is still allowed —
-  but the confirmation says plainly that it will also make those unreachable to a
-  driver. Their bytes are untouched and blktamper will still show them; "hidden" and
-  "destroyed" are different claims and the UI may not blur them.
+"Zero this record and everything after it" was proposed and is right only when what
+follows is already deleted. Where live records are interleaved it destroys their
+directory entries — names, sizes and cluster pointers gone, clusters still marked
+allocated with nothing pointing at them. That turns a reversible problem into an
+irreversible one. `compact` is the correct answer to the same wish.
 
-`neutral` has no such hazard, which is why it is the default.
+### Markers: exhaustive when looking, conservative when writing
 
-### What "neutral" writes, exactly
+The author's instruction was not to let filesystem markers decide what is still there.
+Adopted, with one asymmetry that has to be stated because taking it literally would
+break the safety model:
 
-| Format | Byte 0 | Bytes 1..32 |
-|---|---|---|
-| FAT 8.3 entry | `0xE5` (unchanged) | zero |
-| FAT long-filename entry | `0xE5` (unchanged) | zero — including `attr`, so the record stops advertising itself as a name fragment |
-| exFAT file / stream / name entry | the InUse-cleared type byte (`0x05` / `0x40` / `0x41`, unchanged) | zero |
+- **Discovery must not trust markers.** The listers already walk past the
+  end-of-directory marker and flag residue in never-used records; the scrub guards and
+  the directory layout now do the same. A record past the terminator is invisible to a
+  driver and just as readable on disk.
+- **Destruction must trust them.** The only thing distinguishing a live record from a
+  deleted one *is* that byte. Stop trusting it and there is no basis for refusing to
+  scrub a live file.
 
-The whole record set is scrubbed together — every long-filename fragment, or the
-exFAT primary plus its stream extension plus every name entry. Scrubbing half a set
-would leave a name recoverable from the other half, which is the failure this feature
-exists to prevent.
+Live records are therefore never touched, and a directory-wide mode reads the whole
+allocated extent rather than stopping where a driver would.
 
 ### Scope: records, not file contents
 
 **blktamper scrubs metadata. It does not overwrite file data.** That is
-[`sanitize`](https://github.com/streamx3/sanitize)'s job, and the two tools divide
-cleanly:
-
-- `sanitize` overwrites the file's contents through the filesystem.
-- `blktamper` shows what survived that, and can scrub the metadata residue the
-  filesystem left behind — the directory record, the long filename, the timestamps,
-  the first cluster.
-
-There is also a practical reason blktamper *cannot* do much better on data: the
-delete has already released the cluster chain, so only the **first** cluster of a
-deleted file is still known. The rest is not reachable from the metadata, which is
-precisely what blktamper reports today ("the FAT entry for cluster 495 reads free:
-the chain was released by the delete"). A tool that offered to "scrub the file data"
-while only being able to reach the first cluster would be lying.
+[`sanitize`](https://github.com/streamx3/sanitize)'s job. It is also a limit rather
+than only a division of labour: the delete has already released the cluster chain, so
+only a deleted file's **first** cluster is knowable from its metadata. A command
+offering to "scrub the file data" while reaching one cluster would be lying.
 
 ### Scope: logical, not physical
 
-Out of scope, by decision:
+Out of scope by decision. Whether overwriting a logical sector reaches the physical
+cell is the FTL's business, and on flash it generally does not. The stated position is
+that this belongs at a different layer — an encrypted container from the start, or a
+destroyed device. blktamper reports what it knows (`rotational` comes from sysfs) and
+promises nothing it cannot keep.
 
-- Whether overwriting a logical sector overwrites the physical cell. On flash it
-  generally does not — the FTL, wear levelling and over-provisioning see to that.
-- Whether the filesystem or the device redirects, journals or snapshots the write.
+### The gap this does not close
 
-The position taken is that this is the user's problem to solve at a different layer:
-use an encrypted container from the start, or destroy the device. A tool that
-pretended to guarantee physical erasure through a filesystem interface would be
-making a promise it cannot keep — which is exactly the honesty `sanitize` already
-shows about itself.
+Compaction cleans the directories it is pointed at. It does not reach:
 
-blktamper still *reports* what it knows: `blktamper-io` reads `rotational` from
-sysfs, so the commit screen can say "this is a solid-state device; an overwrite here
-changes the mapping, not necessarily the cell" without claiming to fix it.
+- **Deleted directories.** Their cluster chain is released, so their contents are not
+  reachable by following anything, and blktamper will not show them at all.
+- **Former directory clusters.** A directory that grew and shrank leaves old records
+  in clusters nothing references any more.
+
+Both hold filenames, and both are exactly what the stated opponent would look for.
+Reaching them means scanning the data area for directory-shaped clusters — carving,
+which [01-requirements.md](01-requirements.md) excludes. **That exclusion is now the
+limiting factor on the threat model, and it is an open decision.**
+

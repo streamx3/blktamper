@@ -8,7 +8,7 @@
 use crate::app::App;
 use crate::theme;
 use blktamper_core::render::fmt_offset;
-use blktamper_core::scrub::{Fill, ScrubPlan};
+use blktamper_core::scrub::{Fill, ScrubMode, ScrubPlan};
 use ratatui::layout::Rect;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Clear, Paragraph};
@@ -69,7 +69,10 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App, plan: &ScrubPlan) {
     let ss = app.session.sector_size as u64;
     let mut lines: Vec<Line> = Vec::new();
 
-    lines.extend(kv_wrapped("Record", &plan.label));
+    lines.extend(kv_wrapped(
+        if plan.mode.is_directory_wide() { "Directory" } else { "Record" },
+        &plan.label,
+    ));
     lines.push(cont(format!(
         "{} record(s), {} bytes at {}",
         plan.records(),
@@ -78,48 +81,60 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App, plan: &ScrubPlan) {
     )));
     lines.push(Line::from(""));
 
-    // The two fills, with the refusal spelled out rather than the option just absent.
-    let mark = |on: bool| if on { "(o)" } else { "( )" };
-    lines.push(Line::from(vec![
-        Span::styled(" Fill       ", theme::HEADER),
-        Span::styled(
-            format!("{} neutral", mark(plan.fill == Fill::Neutral)),
-            if plan.fill == Fill::Neutral { theme::HIGHLIGHT } else { Default::default() },
-        ),
-        Span::styled(format!("   {}", Fill::Neutral.describe()), theme::DIM),
-    ]));
-    let zero_style = if !plan.zero_available() {
-        theme::status_style(blktamper_core::Status::Warn)
-    } else if plan.fill == Fill::Zero {
-        theme::HIGHLIGHT
-    } else {
-        Default::default()
-    };
-    lines.push(Line::from(vec![
-        Span::raw(" ".repeat(GUTTER)),
-        Span::styled(format!("{} zero", mark(plan.fill == Fill::Zero)), zero_style),
-        Span::styled(
-            if plan.zero_available() {
-                format!("      {}", Fill::Zero.describe())
-            } else {
-                "      REFUSED HERE:".to_string()
-            },
-            if plan.zero_available() {
-                theme::DIM
-            } else {
-                theme::status_style(blktamper_core::Status::Warn)
-            },
-        ),
-    ]));
+    // All four modes are listed even when one is unavailable, with the reason
+    // spelled out rather than the option silently missing.
+    let modes = [
+        (ScrubMode::Compact, 'c'),
+        (ScrubMode::Sweep, 's'),
+        (ScrubMode::Record(Fill::Neutral), 'n'),
+        (ScrubMode::Record(Fill::Zero), 'z'),
+    ];
+    for (i, (m, k)) in modes.into_iter().enumerate() {
+        let selected = m == plan.mode;
+        let costly = m == ScrubMode::Record(Fill::Zero) && !plan.zero_is_free();
+        let style = if costly {
+            theme::status_style(blktamper_core::Status::Warn)
+        } else if selected {
+            theme::HIGHLIGHT
+        } else {
+            Default::default()
+        };
+        let label = if i == 0 { " Mode       " } else { "            " };
+        lines.push(Line::from(vec![
+            Span::styled(label.to_string(), theme::HEADER),
+            Span::styled(
+                format!("{} [{k}] {:<8}", if selected { "(o)" } else { "( )" }, m.label()),
+                style,
+            ),
+            Span::styled(
+                if costly { "hides live files - see below".to_string() } else { m.describe().to_string() },
+                theme::DIM,
+            ),
+        ]));
+    }
     if let Some(r) = &plan.zero_refusal {
-        for chunk in wrap(&r.message(), TEXT_W - 6) {
+        for chunk in wrap(&r.message(), TEXT_W - 4) {
             lines.push(Line::from(Span::styled(
-                format!("{}{chunk}", " ".repeat(GUTTER + 6)),
+                format!("{}{chunk}", " ".repeat(GUTTER + 4)),
                 theme::status_style(blktamper_core::Status::Warn),
             )));
         }
     }
     lines.push(Line::from(""));
+
+    if !plan.affected.is_empty() {
+        let shown: Vec<String> = plan.affected.iter().take(6).cloned().collect();
+        let more = plan.affected.len().saturating_sub(shown.len());
+        let list = if more > 0 {
+            format!("{} and {more} more", shown.join(", "))
+        } else {
+            shown.join(", ")
+        };
+        lines.extend(kv_wrapped(
+            "Records",
+            &format!("{} affected: {list}", plan.affected.len()),
+        ));
+    }
 
     lines.extend(kv_list("Removes", &plan.removes));
     lines.extend(kv_list("Keeps", &plan.keeps));
@@ -153,9 +168,9 @@ pub fn draw(f: &mut Frame, area: Rect, app: &App, plan: &ScrubPlan) {
     let armed = app.session.write.armed();
     for chunk in wrap(
         if armed {
-            "[Enter] stage   [n] neutral   [z] zero   [Esc] cancel"
+            "[Enter] stage   [c][s][n][z] mode   [Esc] cancel"
         } else {
-            "[Enter] stage   [n] neutral   [z] zero   [Esc] cancel   -- staging writes \
+            "[Enter] stage   [c][s][n][z] mode   [Esc] cancel   -- staging writes \
              nothing; :arm and :commit are still needed to reach the device"
         },
         BOX_W as usize - 4,

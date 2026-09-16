@@ -672,9 +672,9 @@ impl RegionReader for FatReader {
     fn scrub_plan(
         &self,
         node: &Node,
-        fill: blktamper_core::scrub::Fill,
+        mode: blktamper_core::scrub::ScrubMode,
     ) -> Option<blktamper_core::scrub::ScrubPlan> {
-        self.plan_scrub(node, fill)
+        self.plan_scrub(node, mode)
     }
 
     fn id(&self) -> FormatId {

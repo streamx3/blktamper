@@ -37,7 +37,7 @@ pub use node::{Children, Diagnostic, Expander, Link, Node, NodeKind, Status};
 pub use path::{NodePath, Seg};
 pub use reader::{decode, read_struct, ReadCtx};
 pub use registry::{FormatId, FormatProbe, RegionReader, Registry, Score};
-pub use scrub::{Fill, RecordShape, ScrubPlan, ZeroRefusal};
+pub use scrub::{Fill, RecordClass, RecordShape, ScrubMode, ScrubPlan, ZeroRefusal};
 pub use source::{BlockSink, BlockSource, MemSource, ReadOutcome, WriteError};
 pub use span::{Extent, Span};
 pub use value::{EnumEntry, EnumTable, FlagBit, FlagTable, RenderCtx, Repr, Value};

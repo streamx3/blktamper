@@ -52,11 +52,16 @@ pub trait RegionReader: Send + Sync {
     /// GPT take the default.
     ///
     /// The plan is a description: what bytes would change, what information that
-    /// destroys, what survives, and whether `Fill::Zero` is safe here. Applying it is
+    /// destroys, what survives, and whether the mode is safe here. A record-scoped
+    /// mode wants a record node; `Sweep` and `Compact` want a directory node. Applying it is
     /// the caller's decision and goes through the overlay and an explicit commit
     /// (ADR-007, ADR-011).
-    fn scrub_plan(&self, node: &Node, fill: crate::scrub::Fill) -> Option<crate::scrub::ScrubPlan> {
-        let _ = (node, fill);
+    fn scrub_plan(
+        &self,
+        node: &Node,
+        mode: crate::scrub::ScrubMode,
+    ) -> Option<crate::scrub::ScrubPlan> {
+        let _ = (node, mode);
         None
     }
 }

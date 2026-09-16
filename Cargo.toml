@@ -8,7 +8,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "MIT"
 authors = ["Andrii Shelestov"]
@@ -16,9 +16,9 @@ repository = "https://github.com/streamx3/blktamper"
 rust-version = "1.82"
 
 [workspace.dependencies]
-blktamper-core = { path = "crates/blktamper-core", version = "0.1.1" }
-blktamper-io = { path = "crates/blktamper-io", version = "0.1.1" }
-blktamper-formats = { path = "crates/blktamper-formats", version = "0.1.1" }
+blktamper-core = { path = "crates/blktamper-core", version = "0.1.2" }
+blktamper-io = { path = "crates/blktamper-io", version = "0.1.2" }
+blktamper-formats = { path = "crates/blktamper-formats", version = "0.1.2" }
 thiserror = "2"
 
 [profile.release]

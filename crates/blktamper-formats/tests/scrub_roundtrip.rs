@@ -9,6 +9,7 @@
 
 mod common;
 
+use blktamper_core::scrub::ScrubMode;
 use blktamper_core::{BlockSource, Children, Fill, Node, RegionReader};
 use blktamper_io::{FileSink, Journal, Overlay};
 use std::path::{Path, PathBuf};
@@ -41,7 +42,7 @@ fn copy_fixture(name: &str, dir: &Path) -> Option<PathBuf> {
 /// time a label was reworded. `scrub_plan` returning `Some` *is* the predicate, and
 /// it is the same one the TUI uses to decide whether to offer the action.
 fn scrubbable(n: &Node, src: &dyn BlockSource, r: &dyn RegionReader, out: &mut Vec<Node>) {
-    if r.scrub_plan(n, Fill::Neutral).is_some() {
+    if r.scrub_plan(n, ScrubMode::Record(Fill::Neutral)).is_some() {
         out.push(n.clone());
         return; // the set is the unit; its individual records are not separately offered
     }
@@ -81,7 +82,7 @@ fn scrubbing_a_fat32_record_removes_the_name_and_spares_the_live_files() {
         .find(|n| n.label.contains("ECRET"))
         .expect("the deleted SECRET.TXT record")
         .clone();
-    let plan = reader.scrub_plan(&target, Fill::Neutral).expect("a plan for a deleted record");
+    let plan = reader.scrub_plan(&target, ScrubMode::Record(Fill::Neutral)).expect("a plan for a deleted record");
     assert!(plan.records() >= 1);
     let scrubbed_spans: Vec<(u64, usize)> =
         plan.edits.iter().map(|e| (e.offset, e.new.len())).collect();
@@ -162,7 +163,7 @@ fn scrubbing_does_not_disturb_the_other_records_in_the_same_sector() {
     let mut found = Vec::new();
     scrubbable(&reader.root(), &*src, &*reader, &mut found);
     let target = found.iter().find(|n| n.label.contains("ECRET")).unwrap().clone();
-    let plan = reader.scrub_plan(&target, Fill::Neutral).unwrap();
+    let plan = reader.scrub_plan(&target, ScrubMode::Record(Fill::Neutral)).unwrap();
     drop(reader);
     drop(src);
 
@@ -238,7 +239,7 @@ fn scrubbing_an_exfat_entry_set_clears_every_record_of_it() {
     let mut found = Vec::new();
     scrubbable(&reader.root(), &*src, &*reader, &mut found);
     let target = found.first().cloned().expect("a deleted entry set");
-    let plan = reader.scrub_plan(&target, Fill::Neutral).expect("a plan");
+    let plan = reader.scrub_plan(&target, ScrubMode::Record(Fill::Neutral)).expect("a plan");
     assert_eq!(plan.records(), 3, "primary + stream extension + name must go together");
     drop(reader);
     drop(src);
@@ -268,6 +269,188 @@ fn scrubbing_an_exfat_entry_set_clears_every_record_of_it() {
             !text.to_lowercase().contains("corrupt"),
             "fsck.exfat is unhappy after the scrub:\n{text}"
         );
+    }
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+fn compacting_every_directory_leaves_no_tombstone_and_no_lost_file() {
+    // The operation the threat model actually needs: afterwards a technician with the
+    // drive in hand finds directories that look as though the deleted files were
+    // never there -- no names, no timestamps, no 0xE5 markers -- while every live
+    // file is still exactly where the OS expects it.
+    let dir = scratch("compact");
+    let Some(img) = copy_fixture("mbr-fat32.img", &dir) else { return };
+    const VOLUME: u64 = 1024 * 1024;
+
+    let before = mdir(&img);
+    for want in ["README", "DCIM", "A-LONG"] {
+        assert!(before.contains(want), "fixture should list {want}: {before}");
+    }
+    assert!(
+        std::fs::read(&img).unwrap().windows(6).any(|w| w == b"ECRET "),
+        "the fixture must start with a recoverable name"
+    );
+
+    let (src, _) = blktamper_io::open_path(&img, blktamper_io::Access::ReadOnly).unwrap();
+    let reg = blktamper_formats::registry();
+    let reader = reg.get(blktamper_formats::fat::ID).unwrap().open(src.clone(), VOLUME);
+    let dirs = compactable(&reader.root(), &*src, &*reader, ScrubMode::Compact);
+    assert!(!dirs.is_empty(), "the volume must have compactable directories");
+
+    let mut all_edits = Vec::new();
+    let mut removed = 0usize;
+    for d in &dirs {
+        if let Some(p) = reader.scrub_plan(d, ScrubMode::Compact) {
+            removed += p.affected.len();
+            for e in &p.edits {
+                // A compaction may never write a tombstone, and every record it
+                // writes is either a relocated live record or genuine zeros.
+                assert_ne!(e.new[0], 0xE5, "compaction wrote a 0xE5 marker");
+                assert!(
+                    e.new[0] == 0x00 || e.new.iter().any(|&b| b != 0),
+                    "a record must be either live or wholly zero"
+                );
+                if e.new[0] == 0x00 {
+                    assert!(
+                        e.new.iter().all(|&b| b == 0),
+                        "a vacated slot must be zeroed in full, not just marked free: {:02X?}",
+                        &e.new[..8]
+                    );
+                }
+            }
+            all_edits.extend(p.edits);
+        }
+    }
+    assert!(removed > 0, "there were deleted records to remove");
+    drop(reader);
+    drop(src);
+
+    let sink = Arc::new(FileSink::open_rw(&img).unwrap());
+    let overlay = Overlay::new(sink.clone());
+    overlay.stage_all(all_edits.clone(), "fat.dirs").unwrap();
+    let jdir = dir.join("journal");
+    let mut journal = Journal::create_in(&jdir, &img, "test").unwrap();
+    for e in &all_edits {
+        journal.append(e, "fat.dirs", &img).unwrap();
+    }
+    overlay.commit(&*sink, 512).unwrap();
+    drop(overlay);
+    drop(sink);
+
+    // Every live file survived -- checked by mtools, not by us.
+    let after = mdir(&img);
+    for want in ["README", "DCIM", "A-LONG"] {
+        assert!(after.contains(want), "compaction lost {want}:\nbefore:\n{before}\nafter:\n{after}");
+    }
+
+    // And the names are gone from the whole image.
+    let raw = std::fs::read(&img).unwrap();
+    assert!(!raw.windows(6).any(|w| w == b"ECRET "), "the 8.3 name survived");
+    assert!(
+        !raw.windows(14).any(|w| w == "deleted-payloa".as_bytes()),
+        "an 8.3 fragment survived"
+    );
+    let utf16: Vec<u8> = "deleted-p".encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
+    assert!(
+        !raw.windows(utf16.len()).any(|w| w == utf16),
+        "the long filename survived in its UTF-16 fragments"
+    );
+
+    // Byte-for-byte: what landed is what the plan said would land.
+    for e in &all_edits {
+        assert_eq!(&raw[e.offset as usize..e.offset as usize + e.new.len()], &e.new[..]);
+    }
+
+    if have("fsck.vfat") {
+        let out = fsck_partition(&img, VOLUME, &dir);
+        assert!(!out.to_lowercase().contains("corrupt"), "fsck.vfat unhappy:\n{out}");
+    }
+
+    // ...and it is reversible, like every other write.
+    let undo = Journal::read_undo(journal.path()).unwrap();
+    let sink = Arc::new(FileSink::open_rw(&img).unwrap());
+    let overlay = Overlay::new(sink.clone());
+    for (e, path) in &undo {
+        overlay.stage(e.clone(), path).unwrap();
+    }
+    overlay.commit(&*sink, 512).unwrap();
+    drop(overlay);
+    drop(sink);
+    assert!(
+        std::fs::read(&img).unwrap().windows(6).any(|w| w == b"ECRET "),
+        "undo must restore the directories byte for byte"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Every node the reader will accept for a directory-wide mode.
+fn compactable(
+    root: &Node,
+    src: &dyn BlockSource,
+    r: &dyn RegionReader,
+    mode: ScrubMode,
+) -> Vec<Node> {
+    fn go(n: &Node, src: &dyn BlockSource, r: &dyn RegionReader, m: ScrubMode, out: &mut Vec<Node>) {
+        if r.scrub_plan(n, m).is_some() {
+            out.push(n.clone());
+        }
+        match &n.children {
+            Children::Resolved(k) => k.iter().for_each(|c| go(c, src, r, m, out)),
+            Children::Lazy(e) => e.expand(src).iter().for_each(|c| go(c, src, r, m, out)),
+            Children::None => {}
+        }
+    }
+    let mut out = Vec::new();
+    go(root, src, r, mode, &mut out);
+    // The same directory can be reachable by more than one path in the tree (a
+    // record links to the directory it names), and staging its plan twice would
+    // overlap. One plan per directory.
+    let mut seen = std::collections::HashSet::new();
+    out.retain(|n| n.extent.first().is_some_and(|s| seen.insert(s.start_byte())));
+    out
+}
+
+#[test]
+fn sweeping_keeps_live_records_exactly_where_they_are() {
+    let dir = scratch("sweep");
+    let Some(img) = copy_fixture("mbr-fat32.img", &dir) else { return };
+    const VOLUME: u64 = 1024 * 1024;
+
+    let (src, _) = blktamper_io::open_path(&img, blktamper_io::Access::ReadOnly).unwrap();
+    let reg = blktamper_formats::registry();
+    let reader = reg.get(blktamper_formats::fat::ID).unwrap().open(src.clone(), VOLUME);
+    let dirs = compactable(&reader.root(), &*src, &*reader, ScrubMode::Sweep);
+    let Some(root_dir) = dirs.first().cloned() else { return };
+    let plan = reader.scrub_plan(&root_dir, ScrubMode::Sweep).unwrap();
+    assert_eq!(plan.relocated, 0, "a sweep must not move anything");
+    let before = std::fs::read(&img).unwrap();
+    drop(reader);
+    drop(src);
+
+    let sink = Arc::new(FileSink::open_rw(&img).unwrap());
+    let overlay = Overlay::new(sink.clone());
+    overlay.stage_all(plan.edits.clone(), "fat.root").unwrap();
+    overlay.commit(&*sink, 512).unwrap();
+    drop(overlay);
+    drop(sink);
+
+    let after = std::fs::read(&img).unwrap();
+    // Live records are byte-identical; only tombstones and the tail changed.
+    let start = plan.edits.iter().map(|e| e.offset).min().unwrap() as usize;
+    for (i, (b, a)) in before[start..start + 512]
+        .chunks(32)
+        .zip(after[start..start + 512].chunks(32))
+        .enumerate()
+    {
+        if b[0] != 0xE5 && b[0] != 0x00 {
+            assert_eq!(b, a, "sweep changed live record {i}");
+        }
+    }
+    assert!(!after.windows(6).any(|w| w == b"ECRET "), "the name must be gone");
+    let listing = mdir(&img);
+    for want in ["README", "DCIM", "A-LONG"] {
+        assert!(listing.contains(want), "sweep lost {want}: {listing}");
     }
     std::fs::remove_dir_all(&dir).ok();
 }

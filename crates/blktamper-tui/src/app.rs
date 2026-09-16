@@ -4,7 +4,7 @@ use crate::clip::Clipboard;
 use crate::rows::{self, Expansion, Filter, RowSet};
 use crate::session::Session;
 use blktamper_core::render::{copy_hexdump, copy_labelled, copy_tsv, copy_value, fmt_offset};
-use blktamper_core::scrub::{Fill, ScrubPlan};
+use blktamper_core::scrub::{Fill, ScrubMode, ScrubPlan};
 use blktamper_core::{FormatId, Node, RenderCtx};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -23,7 +23,15 @@ pub enum Popup {
     Interpret { at: u64, options: Vec<(FormatId, String, u8)>, sel: usize },
     Command { buffer: String },
     /// Describing an unapplied scrub. Nothing is staged until Enter.
-    Scrub { plan: Box<ScrubPlan> },
+    ///
+    /// Carries both candidate targets, because the modes act on different things:
+    /// `neutral`/`zero` on the selected record, `sweep`/`compact` on the directory
+    /// holding it. Switching mode switches target, and the dialog says so.
+    Scrub {
+        plan: Box<ScrubPlan>,
+        record: Option<Box<Node>>,
+        directory: Option<Box<Node>>,
+    },
     /// The last gate. The device name has to be typed out.
     Commit { typed: String },
 }
@@ -320,42 +328,81 @@ impl App {
         }
         let Some(row) = self.rowset.rows.get(self.row).cloned() else { return };
         let root = self.session.regions[self.region].root_mut().clone();
-        let Some(node) = rows::node_at(&root, &row.index_path).cloned() else { return };
+        let reader = &self.session.regions[self.region].reader;
 
-        match self.session.regions[self.region].reader.scrub_plan(&node, Fill::Neutral) {
-            Some(plan) => self.popup = Popup::Scrub { plan: Box::new(plan) },
+        let record = rows::node_at(&root, &row.index_path)
+            .filter(|n| reader.scrub_plan(n, ScrubMode::Record(Fill::Neutral)).is_some())
+            .cloned();
+
+        // The directory holding it: the nearest ancestor the reader will compact.
+        // Walking up rather than guessing keeps this working whatever the tree shape.
+        let mut directory = None;
+        for depth in (0..=row.index_path.len()).rev() {
+            let Some(n) = rows::node_at(&root, &row.index_path[..depth]) else { continue };
+            if reader.scrub_plan(n, ScrubMode::Compact).is_some() {
+                directory = Some(n.clone());
+                break;
+            }
+        }
+
+        // Compact is the default: it is the only mode that leaves no tombstone.
+        let first = directory
+            .as_ref()
+            .and_then(|d| reader.scrub_plan(d, ScrubMode::Compact))
+            .or_else(|| {
+                record.as_ref().and_then(|r| reader.scrub_plan(r, ScrubMode::Record(Fill::Neutral)))
+            });
+
+        match first {
+            Some(plan) => {
+                self.popup = Popup::Scrub {
+                    plan: Box::new(plan),
+                    record: record.map(Box::new),
+                    directory: directory.map(Box::new),
+                }
+            }
             None => {
-                self.message =
-                    "not a recoverable record: scrubbing is for deleted entries, and it \
-                     takes a whole record set rather than one field"
-                        .into()
+                self.message = "nothing scrubbable here: pick a deleted record, or a \
+                                directory to compact"
+                    .into()
             }
         }
     }
 
-    /// Re-plan the currently-offered scrub with a different fill.
-    fn rescrub(&mut self, fill: Fill) {
-        let Popup::Scrub { plan } = &self.popup else { return };
-        if fill == Fill::Zero && !plan.zero_available() {
-            self.message = plan
-                .zero_refusal
-                .as_ref()
-                .map(|r| r.message())
-                .unwrap_or_else(|| "zeroing is not available here".into());
-            return;
+    /// Re-plan with a different mode, switching target when the mode needs to.
+    fn rescrub(&mut self, mode: ScrubMode) {
+        let Popup::Scrub { plan, record, directory } = &self.popup else { return };
+        // Zeroing with live records after it is allowed and warned about, not
+        // refused: it is recoverable, and R-7.8 says the user decides.
+        if mode == ScrubMode::Record(Fill::Zero) {
+            if let Some(r) = plan.zero_refusal.as_ref() {
+                self.message = r.message();
+            }
         }
-        let label = plan.label.clone();
-        let root = self.session.regions[self.region].root_mut().clone();
-        let Some(row) = self.rowset.rows.get(self.row).cloned() else { return };
-        let Some(node) = rows::node_at(&root, &row.index_path).cloned() else { return };
-        let _ = label;
-        if let Some(p) = self.session.regions[self.region].reader.scrub_plan(&node, fill) {
-            self.popup = Popup::Scrub { plan: Box::new(p) };
+        let target = if mode.is_directory_wide() { directory.clone() } else { record.clone() };
+        let (record, directory) = (record.clone(), directory.clone());
+        let Some(node) = target else {
+            self.message = if mode.is_directory_wide() {
+                "no directory here to work on".into()
+            } else {
+                "the selection is not a deleted record; compact or sweep the directory \
+                 instead"
+                    .into()
+            };
+            return;
+        };
+        match self.session.regions[self.region].reader.scrub_plan(&node, mode) {
+            Some(p) => {
+                self.popup = Popup::Scrub { plan: Box::new(p), record, directory };
+            }
+            None => self.message = format!("{} is not available here", mode.label()),
         }
     }
 
     fn stage_scrub(&mut self) {
-        let Popup::Scrub { plan } = std::mem::replace(&mut self.popup, Popup::None) else { return };
+        let Popup::Scrub { plan, .. } = std::mem::replace(&mut self.popup, Popup::None) else {
+            return;
+        };
         let path = self.selected_path();
         match self.session.stage(plan.edits.clone(), &path) {
             Ok(()) => {
@@ -620,19 +667,12 @@ impl App {
                 }
                 return;
             }
-            Popup::Scrub { plan } => {
-                let (zero_ok, refusal) = (plan.zero_available(), plan.zero_refusal.clone());
+            Popup::Scrub { .. } => {
                 match key.code {
-                    KeyCode::Char('n') => self.rescrub(Fill::Neutral),
-                    KeyCode::Char('z') => {
-                        if zero_ok {
-                            self.rescrub(Fill::Zero)
-                        } else {
-                            self.message = refusal
-                                .map(|r| r.message())
-                                .unwrap_or_else(|| "zeroing is not available here".into());
-                        }
-                    }
+                    KeyCode::Char('c') => self.rescrub(ScrubMode::Compact),
+                    KeyCode::Char('s') => self.rescrub(ScrubMode::Sweep),
+                    KeyCode::Char('n') => self.rescrub(ScrubMode::Record(Fill::Neutral)),
+                    KeyCode::Char('z') => self.rescrub(ScrubMode::Record(Fill::Zero)),
                     KeyCode::Enter => self.stage_scrub(),
                     KeyCode::Esc | KeyCode::Char('q') => self.popup = Popup::None,
                     _ => {}

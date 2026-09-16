@@ -11,7 +11,10 @@
 
 use super::{cluster_chain, types, ExfatReader, Geometry};
 use blktamper_core::node::Diagnostic;
-use blktamper_core::scrub::{scrub_edit, Fill, RecordShape, ScrubPlan, ZeroRefusal};
+use blktamper_core::scrub::{
+    layout_directory, scrub_edit, Fill, RecordClass, RecordShape, ScrubMode, ScrubPlan, ZeroRefusal,
+};
+use blktamper_core::ByteEdit;
 use blktamper_core::{Node, Span};
 
 const ENTRY_SIZE: u64 = 32;
@@ -20,8 +23,226 @@ const ENTRY_SIZE: u64 = 32;
 /// to terminate either way.
 const MAX_SCAN_CLUSTERS: usize = 4096;
 
+/// A directory holding more records than this is not one we will rewrite in a single
+/// commit; the blast radius stops being previewable.
+const MAX_DIR_RECORDS: usize = 16_384;
+
+/// How a record reads right now. `InUse` is one bit of the type byte, and it is the
+/// only thing distinguishing a live record from a deleted one — so the conservative
+/// reading is the safe one.
+fn classify(b: &[u8]) -> RecordClass {
+    match b.first().copied() {
+        Some(types::END_OF_DIRECTORY) => RecordClass::Free,
+        Some(t) if types::is_in_use(t) => RecordClass::Live,
+        Some(_) => RecordClass::Deleted,
+        None => RecordClass::Free,
+    }
+}
+
+/// Do these bytes read as a directory rather than as file data?
+///
+/// exFAT's type byte is structured: bit 7 InUse, bit 6 category, bit 5 importance,
+/// bits 0..4 a type code, and code 0 is reserved for the end-of-directory marker. So
+/// any allocated record must have a non-zero type code, which arbitrary data fails
+/// often enough to be a useful filter.
+fn looks_like_directory(records: &[Vec<u8>]) -> bool {
+    let mut used = 0usize;
+    for b in records {
+        if b.len() < 32 {
+            return false;
+        }
+        let t = b[0];
+        if t == types::END_OF_DIRECTORY {
+            continue;
+        }
+        used += 1;
+        if t & 0x1F == 0 {
+            return false;
+        }
+    }
+    used > 0
+}
+
+/// A record's filename, for the confirmation list. Only name records carry one.
+fn record_name(b: &[u8]) -> String {
+    if types::undeleted(b[0]) == types::FILE_NAME {
+        let s = blktamper_core::value::utf16le_lossy(&b[2..32], true);
+        if !s.is_empty() {
+            return s;
+        }
+    }
+    format!("{:#04X} record", b[0])
+}
+
 impl ExfatReader {
-    pub(super) fn plan_scrub(&self, node: &Node, fill: Fill) -> Option<ScrubPlan> {
+    pub(super) fn plan_scrub(&self, node: &Node, mode: ScrubMode) -> Option<ScrubPlan> {
+        match mode {
+            ScrubMode::Record(fill) => self.plan_record(node, fill),
+            ScrubMode::Sweep | ScrubMode::Compact => self.plan_directory(node, mode),
+        }
+    }
+
+    /// Rewrite a whole directory. See the FAT module for the reasoning; the only
+    /// differences here are the marker and that an entry set is several contiguous
+    /// records, which packing in order preserves.
+    fn plan_directory(&self, node: &Node, mode: ScrubMode) -> Option<ScrubPlan> {
+        let src = &*self.src;
+        let (boot, _) = src.read_vec(self.base, 512);
+        let (geo, _) = Geometry::from_boot(&boot, self.base, src.logical_sector_size());
+        if !geo.trusted {
+            return None;
+        }
+        let span = match node.extent.spans() {
+            [s] => *s,
+            _ => return None,
+        };
+        let start = span.start_byte();
+        let heap = geo.heap_byte()?;
+        if start < heap || span.byte_len() != geo.cluster_size {
+            return None;
+        }
+        if (start - heap) % geo.cluster_size != 0 {
+            return None;
+        }
+
+        // The whole allocated extent, terminator or not.
+        let runs = self.dir_runs_from(&geo, start).ok()?;
+        let mut offsets: Vec<u64> = Vec::new();
+        let mut records: Vec<Vec<u8>> = Vec::new();
+        for (at, len) in &runs {
+            let mut off = *at;
+            let end = at.saturating_add(*len);
+            while off + ENTRY_SIZE <= end {
+                let (b, outcome) = src.read_vec(off, ENTRY_SIZE as usize);
+                if b.len() != ENTRY_SIZE as usize
+                    || outcome == blktamper_core::ReadOutcome::Unreadable
+                {
+                    return None;
+                }
+                offsets.push(off);
+                records.push(b);
+                off += ENTRY_SIZE;
+                if records.len() >= MAX_DIR_RECORDS {
+                    break;
+                }
+            }
+        }
+        if records.is_empty() {
+            return None;
+        }
+
+        // As in the FAT module: a cluster-sized, cluster-aligned span is also the
+        // shape of a file's first cluster, and rewriting file data as directory
+        // records is the worst outcome available here.
+        if !looks_like_directory(&records) {
+            return None;
+        }
+
+        let class: Vec<RecordClass> = records.iter().map(|b| classify(b)).collect();
+        let new = layout_directory(&records, &class, mode, RecordShape::DIR_ENTRY_32);
+
+        let mut edits = Vec::new();
+        for ((off, old), fresh) in offsets.iter().zip(&records).zip(&new) {
+            if old == fresh {
+                continue;
+            }
+            edits.push(ByteEdit {
+                offset: *off,
+                old: old.clone(),
+                new: fresh.clone(),
+                reason: format!("{} directory", mode.label()),
+            });
+        }
+        if edits.is_empty() {
+            return None;
+        }
+
+        let deleted: Vec<String> = records
+            .iter()
+            .zip(&class)
+            .filter(|(_, c)| **c == RecordClass::Deleted)
+            .map(|(b, _)| record_name(b))
+            .collect();
+        let live = class.iter().filter(|c| **c == RecordClass::Live).count();
+        let relocated = if mode == ScrubMode::Compact {
+            records
+                .iter()
+                .zip(&new)
+                .zip(&class)
+                .filter(|((old, fresh), c)| **c == RecordClass::Live && old != fresh)
+                .count()
+        } else {
+            0
+        };
+
+        let mut removes = vec![format!(
+            "{} deleted record(s), with their filenames, timestamps, lengths and \
+             cluster pointers",
+            deleted.len()
+        )];
+        let residue = records
+            .iter()
+            .zip(&class)
+            .filter(|(b, c)| **c == RecordClass::Free && !b.iter().all(|&x| x == 0))
+            .count();
+        if residue > 0 {
+            removes.push(format!(
+                "{residue} record(s) typed 0x00 whose bytes are not zero — entries \
+                 overwritten rather than erased"
+            ));
+        }
+
+        let mut keeps = vec![format!("all {live} record(s) still in use")];
+        let mut warnings = Vec::new();
+        match mode {
+            ScrubMode::Compact => {
+                keeps.push(
+                    "nothing else: no cleared-InUse record remains, and every byte the \
+                     survivors vacate is zeroed"
+                        .into(),
+                );
+                if relocated > 0 {
+                    warnings.push(
+                        Diagnostic::warn(format!(
+                            "{relocated} live record(s) move to close the gap, so the whole \
+                             directory is rewritten rather than one sector"
+                        ))
+                        .with_hint(
+                            "entry sets stay contiguous because packing preserves order",
+                        ),
+                    );
+                }
+            }
+            _ => keeps.push(format!(
+                "{} cleared-InUse record(s) sitting between live ones",
+                deleted.len()
+            )),
+        }
+        keeps.push("the files' data clusters, which this command does not reach".into());
+        keeps.push("the allocation bitmap, which the delete already updated".into());
+        warnings.push(
+            Diagnostic::warn(
+                "this does not touch any file's data. Names and metadata go; contents \
+                 stay where they are."
+                    .to_string(),
+            )
+            .with_hint("overwriting contents is sanitize's job"),
+        );
+
+        Some(ScrubPlan {
+            label: node.label.to_string(),
+            mode,
+            affected: deleted,
+            relocated,
+            edits,
+            removes,
+            keeps,
+            zero_refusal: None,
+            warnings,
+        })
+    }
+
+    fn plan_record(&self, node: &Node, fill: Fill) -> Option<ScrubPlan> {
         let spans = node.extent.spans();
         if spans.is_empty() {
             return None;
@@ -78,7 +299,9 @@ impl ExfatReader {
 
         Some(ScrubPlan {
             label: node.label.to_string(),
-            fill,
+            mode: ScrubMode::Record(fill),
+            affected: ordered.iter().map(|(_, b)| record_name(b)).collect(),
+            relocated: 0,
             edits,
             removes,
             keeps,
@@ -100,6 +323,7 @@ impl ExfatReader {
         let src = &*self.src;
         let mut count = 0usize;
         let mut first_at: Option<u64> = None;
+        let mut past_terminator = false;
 
         for (start, len) in runs {
             let mut off = start;
@@ -111,10 +335,12 @@ impl ExfatReader {
                 {
                     return Err(format!("the directory could not be read at {off:#012X}"));
                 }
+                // Does not stop at the end-of-directory marker: a driver does, so a
+                // live record past it is already invisible, but the safety check must
+                // not believe a marker the viewer pointedly does not.
                 if b[0] == types::END_OF_DIRECTORY {
-                    return Ok(pack(count, first_at));
-                }
-                if types::is_in_use(b[0]) {
+                    past_terminator = true;
+                } else if types::is_in_use(b[0]) && !past_terminator {
                     count += 1;
                     first_at.get_or_insert(off);
                 }
@@ -313,7 +539,7 @@ mod tests {
     fn neutral_keeps_each_records_own_marker() {
         let (img, root) = volume(&deleted_set(7, 1234));
         let r = reader(img);
-        let p = r.scrub_plan(&set_node(root, 3), Fill::Neutral).expect("a plan");
+        let p = r.scrub_plan(&set_node(root, 3), ScrubMode::Record(Fill::Neutral)).expect("a plan");
         assert_eq!(p.records(), 3);
         // exFAT uses a different marker per record kind; neutral must not normalise.
         assert_eq!(p.edits[0].new[0], 0x05);
@@ -328,13 +554,14 @@ mod tests {
     }
 
     #[test]
-    fn zero_is_refused_when_a_live_record_follows() {
+    fn zeroing_is_warned_about_not_refused_when_a_live_record_follows() {
         let mut entries = deleted_set(7, 10);
         entries.extend_from_slice(&live_entry());
         let (img, root) = volume(&entries);
         let r = reader(img);
-        let p = r.scrub_plan(&set_node(root, 3), Fill::Zero).unwrap();
-        match p.zero_refusal.as_ref().expect("must refuse") {
+        let p = r.scrub_plan(&set_node(root, 3), ScrubMode::Record(Fill::Zero)).unwrap();
+        assert!(!p.edits.is_empty(), "the plan is still offered: warned, not refused");
+        match p.zero_refusal.as_ref().expect("the cost must be stated") {
             ZeroRefusal::InUseRecordsFollow { count, first_at } => {
                 assert_eq!(*count, 1);
                 assert_eq!(*first_at, root + 96);
@@ -347,8 +574,8 @@ mod tests {
     fn zero_is_allowed_when_only_free_space_follows() {
         let (img, root) = volume(&deleted_set(7, 10));
         let r = reader(img);
-        let p = r.scrub_plan(&set_node(root, 3), Fill::Zero).unwrap();
-        assert!(p.zero_available(), "{:?}", p.zero_refusal);
+        let p = r.scrub_plan(&set_node(root, 3), ScrubMode::Record(Fill::Zero)).unwrap();
+        assert!(p.zero_is_free(), "{:?}", p.zero_refusal);
         for e in &p.edits {
             assert!(e.new.iter().all(|&b| b == 0));
         }
@@ -360,7 +587,7 @@ mod tests {
         entries.extend_from_slice(&[0u8; 64]);
         let (img, root) = volume(&entries);
         let r = reader(img);
-        assert!(r.scrub_plan(&set_node(root, 1), Fill::Neutral).is_none());
+        assert!(r.scrub_plan(&set_node(root, 1), ScrubMode::Record(Fill::Neutral)).is_none());
     }
 
     #[test]
@@ -371,7 +598,7 @@ mod tests {
         entries.extend_from_slice(&live_entry());
         let (img, root) = volume(&entries);
         let r = reader(img);
-        assert!(r.scrub_plan(&set_node(root, 4), Fill::Neutral).is_none());
+        assert!(r.scrub_plan(&set_node(root, 4), ScrubMode::Record(Fill::Neutral)).is_none());
     }
 
     #[test]
@@ -383,7 +610,7 @@ mod tests {
             extent: Extent::One(Span::bytes(root + 64 + 2, 30)),
             ..Default::default()
         };
-        assert!(r.scrub_plan(&field, Fill::Neutral).is_none());
+        assert!(r.scrub_plan(&field, ScrubMode::Record(Fill::Neutral)).is_none());
     }
 
     #[test]
@@ -392,7 +619,7 @@ mod tests {
         entries[32 + 0x01] |= 0x02; // NoFatChain
         let (img, root) = volume(&entries);
         let r = reader(img);
-        let p = r.scrub_plan(&set_node(root, 3), Fill::Neutral).unwrap();
+        let p = r.scrub_plan(&set_node(root, 3), ScrubMode::Record(Fill::Neutral)).unwrap();
         assert!(
             p.warnings.iter().any(|w| w.message.contains("NoFatChain")),
             "a contiguous file's data is fully locatable and the warning must say so"

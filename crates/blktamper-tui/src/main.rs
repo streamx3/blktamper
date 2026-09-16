@@ -325,7 +325,8 @@ mod tests {
 
     /// Walk a region's tree for the first node its reader will scrub.
     fn first_scrubbable(app: &mut App, region: usize) -> Option<blktamper_core::Node> {
-        use blktamper_core::{BlockSource, Children, Fill, Node, RegionReader};
+        use blktamper_core::scrub::{Fill, ScrubMode};
+        use blktamper_core::{BlockSource, Children, Node, RegionReader};
         fn go(
             n: &Node,
             src: &dyn BlockSource,
@@ -335,7 +336,7 @@ mod tests {
             if out.is_some() {
                 return;
             }
-            if r.scrub_plan(n, Fill::Neutral).is_some() {
+            if r.scrub_plan(n, ScrubMode::Record(Fill::Neutral)).is_some() {
                 *out = Some(n.clone());
                 return;
             }
@@ -354,6 +355,7 @@ mod tests {
 
     #[test]
     fn the_scrub_dialog_shows_the_blast_radius() {
+        use blktamper_core::scrub::ScrubMode;
         use blktamper_core::Fill;
         let Some(mut app) = app_for("mbr-fat32.img") else { return };
         let Some(fat) = app.session.regions.iter().position(|r| r.format.0 == "fat") else {
@@ -363,16 +365,24 @@ mod tests {
         let Some(node) = first_scrubbable(&mut app, fat) else {
             panic!("the fixture must contain a deleted record")
         };
-        let plan = app.session.regions[fat].reader.scrub_plan(&node, Fill::Neutral).unwrap();
-        app.popup = crate::app::Popup::Scrub { plan: Box::new(plan) };
+        let plan = app.session.regions[fat]
+            .reader
+            .scrub_plan(&node, ScrubMode::Record(Fill::Neutral))
+            .unwrap();
+        app.popup = crate::app::Popup::Scrub {
+            plan: Box::new(plan),
+            record: Some(Box::new(node)),
+            directory: None,
+        };
 
         let out = render(&mut app, 110, 40);
         if std::env::var_os("BLKTAMPER_SHOW").is_some() {
             println!("{out}");
         }
         assert!(out.contains("scrub deleted record"), "{out}");
-        assert!(out.contains("neutral"), "{out}");
-        assert!(out.contains("zero"), "{out}");
+        for m in ["compact", "sweep", "neutral", "zero"] {
+            assert!(out.contains(m), "mode {m} missing from the dialog: {out}");
+        }
         assert!(out.contains("Removes"), "{out}");
         assert!(out.contains("Keeps"), "{out}");
         assert!(out.contains("Rewrites"), "the sector blast radius must be stated: {out}");
@@ -388,7 +398,7 @@ mod tests {
         // On the MBR region nothing is recoverable, so S must decline and say why.
         app.on_key(key('S'));
         assert!(matches!(app.popup, crate::app::Popup::None));
-        assert!(app.message.contains("recoverable"), "{}", app.message);
+        assert!(app.message.contains("scrubbable"), "{}", app.message);
         let _ = render(&mut app, 110, 34);
     }
 

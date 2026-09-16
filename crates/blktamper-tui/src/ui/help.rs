@@ -40,6 +40,17 @@ const KEYS: &[(&str, &str)] = &[
     ("y p", "node path"),
     ("y t", "whole visible table as TSV"),
     ("", ""),
+    ("", ""),
+    ("SCRUB  (deleted records only)", ""),
+    ("S", "describe overwriting the selected deleted record"),
+    ("  n / z", "in that dialog: neutral fill / zero fill"),
+    ("  Enter", "stage it -- still writes nothing"),
+    (":arm", "open the write handle (needs --rw)"),
+    (":diff", "what is staged"),
+    (":revert", "discard everything staged"),
+    (":commit", "write it, after typing the device name"),
+    (":disarm", "close the write handle again"),
+    ("", ""),
     ("q / Ctrl-c", "quit"),
 ];
 
@@ -61,7 +72,7 @@ pub fn draw(f: &mut Frame, area: Rect) {
     let rect = super::centered(area, 60, h);
     f.render_widget(Clear, rect);
     f.render_widget(
-        Paragraph::new(lines).block(super::popup_block("keys - read-only build")),
+        Paragraph::new(lines).block(super::popup_block("keys")),
         rect,
     );
 }

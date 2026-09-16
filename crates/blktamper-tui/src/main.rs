@@ -1,8 +1,8 @@
 //! `blktamper` — a forensic structure viewer for block devices.
 //!
-//! Read-only. This build cannot write to a device at all: `blktamper-io` has no
-//! write path, and the device is opened `O_RDONLY`. See `doc/07-write-safety.md`
-//! for what a write-capable build would have to do first.
+//! Read-only unless `--rw` is passed, and even then nothing is written until you
+//! arm the session and commit explicitly. Without `--rw` the process never opens a
+//! writable descriptor for the device at all. See `doc/07-write-safety.md`.
 
 #![forbid(unsafe_code)]
 
@@ -27,7 +27,9 @@ use std::time::Duration;
     long_about = "Opens a block device or disk image and shows its partition tables, \
                   filesystem headers and directory records as labelled tables, with \
                   every field traceable to the bytes it came from.\n\n\
-                  This build is READ-ONLY. It opens devices O_RDONLY and has no write path."
+                  Devices are opened read-only. Passing --rw permits arming; arming \
+                  opens the write handle; committing needs the device name typed. \
+                  Nothing is written before all three."
 )]
 struct Cli {
     /// Block device or image file, e.g. /dev/sdc or disk.img
@@ -50,6 +52,11 @@ struct Cli {
     /// bug reports, and checking the layout at a size you do not have to hand.
     #[arg(long, value_name = "WxH")]
     screenshot: Option<String>,
+
+    /// Permit arming. On its own this writes nothing and opens no writable handle:
+    /// `:arm` inside the app does that, and `:commit` is a third, separate act.
+    #[arg(long)]
+    rw: bool,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -61,7 +68,7 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    let session = match Session::open(&cli.device, cli.sector_size) {
+    let session = match Session::open(&cli.device, cli.sector_size, cli.rw) {
         Ok(s) => s,
         Err(e) => {
             // The advice is the point; print it plainly rather than through a
@@ -215,7 +222,7 @@ mod tests {
     }
 
     fn app_for(name: &str) -> Option<App> {
-        Some(App::new(Session::open(&fixture(name)?, None).ok()?))
+        Some(App::new(Session::open(&fixture(name)?, None, false).ok()?))
     }
 
     fn render(app: &mut App, w: u16, h: u16) -> String {
@@ -309,11 +316,134 @@ mod tests {
     #[test]
     fn garbage_renders_as_garbage_rather_than_crashing() {
         let Some(path) = fixture("garbage.img") else { return };
-        let session = Session::open(&path, None).unwrap();
+        let session = Session::open(&path, None, false).unwrap();
         // Nothing should have been recognised, which is the honest answer.
         let mut app = App::new(session);
         let out = render(&mut app, 100, 30);
         assert!(out.contains("blktamper"));
+    }
+
+    /// Walk a region's tree for the first node its reader will scrub.
+    fn first_scrubbable(app: &mut App, region: usize) -> Option<blktamper_core::Node> {
+        use blktamper_core::{BlockSource, Children, Fill, Node, RegionReader};
+        fn go(
+            n: &Node,
+            src: &dyn BlockSource,
+            r: &dyn RegionReader,
+            out: &mut Option<Node>,
+        ) {
+            if out.is_some() {
+                return;
+            }
+            if r.scrub_plan(n, Fill::Neutral).is_some() {
+                *out = Some(n.clone());
+                return;
+            }
+            match &n.children {
+                Children::Resolved(k) => k.iter().for_each(|c| go(c, src, r, out)),
+                Children::Lazy(e) => e.expand(src).iter().for_each(|c| go(c, src, r, out)),
+                Children::None => {}
+            }
+        }
+        let src = app.session.src.clone();
+        let root = app.session.regions.get_mut(region)?.root_mut().clone();
+        let mut out = None;
+        go(&root, &*src, &*app.session.regions[region].reader, &mut out);
+        out
+    }
+
+    #[test]
+    fn the_scrub_dialog_shows_the_blast_radius() {
+        use blktamper_core::Fill;
+        let Some(mut app) = app_for("mbr-fat32.img") else { return };
+        let Some(fat) = app.session.regions.iter().position(|r| r.format.0 == "fat") else {
+            return;
+        };
+        app.enter_region(fat);
+        let Some(node) = first_scrubbable(&mut app, fat) else {
+            panic!("the fixture must contain a deleted record")
+        };
+        let plan = app.session.regions[fat].reader.scrub_plan(&node, Fill::Neutral).unwrap();
+        app.popup = crate::app::Popup::Scrub { plan: Box::new(plan) };
+
+        let out = render(&mut app, 110, 40);
+        if std::env::var_os("BLKTAMPER_SHOW").is_some() {
+            println!("{out}");
+        }
+        assert!(out.contains("scrub deleted record"), "{out}");
+        assert!(out.contains("neutral"), "{out}");
+        assert!(out.contains("zero"), "{out}");
+        assert!(out.contains("Removes"), "{out}");
+        assert!(out.contains("Keeps"), "{out}");
+        assert!(out.contains("Rewrites"), "the sector blast radius must be stated: {out}");
+        assert!(
+            out.contains("does not touch the file"),
+            "the dialog must not let the user think the data is gone: {out}"
+        );
+    }
+
+    #[test]
+    fn the_scrub_dialog_offers_itself_only_on_a_recoverable_record() {
+        let Some(mut app) = app_for("mbr-fat32.img") else { return };
+        // On the MBR region nothing is recoverable, so S must decline and say why.
+        app.on_key(key('S'));
+        assert!(matches!(app.popup, crate::app::Popup::None));
+        assert!(app.message.contains("recoverable"), "{}", app.message);
+        let _ = render(&mut app, 110, 34);
+    }
+
+    #[test]
+    fn staging_needs_no_arming_but_committing_does() {
+        let Some(mut app) = app_for("mbr-fat32.img") else { return };
+        app.on_key(key(':'));
+        for c in "commit".chars() {
+            app.on_key(key(c));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(app.message.contains("not armed"), "{}", app.message);
+
+        // ...and arming is refused without --rw, which is the point of the flag.
+        app.on_key(key(':'));
+        for c in "arm".chars() {
+            app.on_key(key(c));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(app.message.contains("--rw"), "{}", app.message);
+    }
+
+    #[test]
+    fn a_read_only_session_holds_no_writable_handle() {
+        let Some(app) = app_for("mbr-fat32.img") else { return };
+        assert!(!app.session.write.permitted);
+        assert!(!app.session.write.armed());
+        assert!(!app.session.overlay.is_dirty());
+    }
+
+    #[test]
+    fn quitting_with_staged_edits_asks_first() {
+        let Some(path) = fixture("mbr-fat32.img") else { return };
+        let session = Session::open(&path, None, true).unwrap();
+        let mut app = App::new(session);
+        // Stage something directly: the guard is about unsaved state, not about how
+        // it got there.
+        let edit = blktamper_core::ByteEdit {
+            offset: 0,
+            old: {
+                use blktamper_core::BlockSource;
+                app.session.src.read_vec(0, 2).0
+            },
+            new: vec![0xAA, 0xBB],
+            reason: "test".into(),
+        };
+        app.session.stage(vec![edit], "test").unwrap();
+
+        app.on_key(key(':'));
+        for c in "q".chars() {
+            app.on_key(key(c));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::empty()));
+        assert!(!app.should_quit, "staged edits must not be silently discarded");
+        assert!(app.message.contains("revert"), "{}", app.message);
     }
 
     #[test]

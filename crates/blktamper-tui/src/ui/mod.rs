@@ -4,6 +4,7 @@
 mod detail;
 mod help;
 mod hex;
+mod scrub;
 mod table;
 mod tree;
 
@@ -64,6 +65,8 @@ pub fn draw(f: &mut Frame, app: &mut App) {
             detail::draw_interpret(f, area, at, &options, sel)
         }
         Popup::Command { buffer } => draw_command(f, chunks[3], &buffer),
+        Popup::Scrub { plan } => scrub::draw(f, area, app, &plan),
+        Popup::Commit { typed } => scrub::draw_commit(f, area, app, &typed),
         Popup::None => {}
     }
 }
@@ -77,10 +80,17 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| i.path.display().to_string());
+    let (mode, mode_style) = if app.session.write.armed() {
+        (" ARMED ", theme::WARN_BANNER)
+    } else if app.session.write.permitted {
+        ("rw, not armed", theme::DIM)
+    } else {
+        ("READ-ONLY", theme::DIM)
+    };
     let mut spans = vec![
         Span::styled("blktamper", theme::HEADER),
         Span::raw(" "),
-        Span::styled("READ-ONLY", theme::DIM),
+        Span::styled(mode, mode_style),
         Span::raw("  "),
         Span::raw(name),
         Span::raw("  "),
@@ -92,6 +102,14 @@ fn draw_title(f: &mut Frame, area: Rect, app: &App) {
         spans.push(Span::raw("  "));
         spans.push(Span::styled(
             format!("sector size overridden (device says {})", i.logical_sector_size),
+            theme::WARN_BANNER,
+        ));
+    }
+    let staged = app.session.overlay.staged().len();
+    if staged > 0 {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(
+            format!(" {staged} staged, not written "),
             theme::WARN_BANNER,
         ));
     }

@@ -5,10 +5,34 @@
 //! hunting across the whole device — an inspector should show you what the metadata
 //! claims, and let you go looking yourself when the metadata is lying.
 
-use blktamper_core::{BlockSource, FormatId, LinkKind, Node, NodeKind, RegionReader, Registry, Score};
-use blktamper_io::{open_path, Access, CachedSource, DeviceInfo, OpenError};
-use std::path::Path;
+use blktamper_core::{
+    BlockSource, ByteEdit, FormatId, LinkKind, Node, NodeKind, RegionReader, Registry, Score,
+};
+use blktamper_io::{
+    open_path, Access, CachedSource, DeviceInfo, FileSink, Journal, OpenError, Overlay,
+};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
+/// How far writing has been permitted.
+///
+/// Three gates, and each one is a separate deliberate act: the command line permits
+/// arming, arming opens the write handle, and committing needs the device name typed
+/// (ADR-007). Nothing here is on by default.
+#[derive(Debug, Default)]
+pub struct WriteState {
+    /// `--rw` was passed. On its own this permits nothing but arming.
+    pub permitted: bool,
+    /// The write handle, opened by `:arm` and not before. While this is `None` the
+    /// process holds no writable file descriptor for the device at all.
+    pub sink: Option<Arc<FileSink>>,
+}
+
+impl WriteState {
+    pub fn armed(&self) -> bool {
+        self.sink.is_some()
+    }
+}
 
 /// Below this, a match is too weak to put in the region tree on its own; the user
 /// can still force it with `:as`.
@@ -53,7 +77,11 @@ impl Region {
 
 #[derive(Debug)]
 pub struct Session {
+    /// What everything reads through: the overlay, so staged edits are visible to
+    /// the parsers and a checksum turns green before anything touches the device.
     pub src: Arc<dyn BlockSource>,
+    pub overlay: Arc<Overlay>,
+    pub write: WriteState,
     pub info: DeviceInfo,
     pub registry: Registry,
     pub regions: Vec<Region>,
@@ -63,17 +91,103 @@ pub struct Session {
 }
 
 impl Session {
-    pub fn open(path: &Path, sector_override: Option<u32>) -> Result<Session, OpenError> {
+    pub fn open(
+        path: &Path,
+        sector_override: Option<u32>,
+        write_permitted: bool,
+    ) -> Result<Session, OpenError> {
         let (raw, mut info) = open_path(path, Access::ReadOnly)?;
         if let Some(s) = sector_override {
             info.logical_sector_size = s;
         }
         let sector_size = info.logical_sector_size;
-        let src: Arc<dyn BlockSource> = Arc::new(CachedSource::new(raw));
+        let cached: Arc<dyn BlockSource> = Arc::new(CachedSource::new(raw));
+        let overlay = Arc::new(Overlay::new(cached));
+        let src: Arc<dyn BlockSource> = overlay.clone();
         let registry = blktamper_formats::registry();
-        let mut s = Session { src, info, registry, regions: Vec::new(), sector_size };
+        let mut s = Session {
+            src,
+            overlay,
+            write: WriteState { permitted: write_permitted, sink: None },
+            info,
+            registry,
+            regions: Vec::new(),
+            sector_size,
+        };
         s.discover();
         Ok(s)
+    }
+
+    /// Open the write handle. Refused unless `--rw` was passed.
+    ///
+    /// Deliberately not done at start-up: until this succeeds the process holds no
+    /// writable descriptor, so "it cannot have written" is a fact about the file
+    /// table, not a claim about the code.
+    pub fn arm(&mut self) -> Result<(), String> {
+        if !self.write.permitted {
+            return Err("this session was not started with --rw; writing is not permitted".into());
+        }
+        if self.write.armed() {
+            return Err("already armed".into());
+        }
+        let sink = FileSink::open_rw(&self.info.path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::PermissionDenied => format!(
+                "{}: permission denied for writing. Reading worked, so this is the write \
+                 bit: try sudo, or check that the device is not read-only.",
+                self.info.path.display()
+            ),
+            std::io::ErrorKind::ResourceBusy => format!(
+                "{}: the kernel refused to open it for writing (EBUSY). Since Linux 6.8 a \
+                 kernel built without CONFIG_BLK_DEV_WRITE_MOUNTED refuses this while the \
+                 device is mounted. Unmount it first.",
+                self.info.path.display()
+            ),
+            _ => format!("{}: {e}", self.info.path.display()),
+        })?;
+        let mut sink = sink;
+        sink.set_logical_sector_size(self.sector_size);
+        self.write.sink = Some(Arc::new(sink));
+        Ok(())
+    }
+
+    pub fn disarm(&mut self) {
+        self.write.sink = None;
+    }
+
+    /// Write every staged edit, journalling the originals first.
+    ///
+    /// The journal is flushed before the device is touched, so a crash between the
+    /// two leaves a recoverable record rather than a mystery.
+    pub fn commit(&mut self, stamp: &str) -> Result<CommitOutcome, String> {
+        let Some(sink) = self.write.sink.clone() else {
+            return Err("not armed: run :arm first".into());
+        };
+        let staged = self.overlay.staged();
+        if staged.is_empty() {
+            return Err("nothing staged".into());
+        }
+
+        let mut journal = Journal::create(&self.info.path, stamp).map_err(|e| e.to_string())?;
+        for s in &staged {
+            journal.append(&s.edit, &s.path, &self.info.path).map_err(|e| e.to_string())?;
+        }
+
+        let sectors = self
+            .overlay
+            .commit(&*sink, self.sector_size as u64)
+            .map_err(|e| e.to_string())?;
+
+        let bytes = self.overlay.bytes_changed();
+        self.overlay.revert(); // the edits are on the device now; the overlay is spent
+        for r in &mut self.regions {
+            r.root = None; // re-parse against what is actually there
+        }
+        Ok(CommitOutcome { sectors, bytes, edits: staged.len(), journal: journal.path().into() })
+    }
+
+    /// Stage a set of edits as one unit.
+    pub fn stage(&self, edits: Vec<ByteEdit>, path: &str) -> Result<(), String> {
+        self.overlay.stage_all(edits, path).map_err(|e| e.to_string())
     }
 
     /// Probe sector 0, then follow whatever it points at one level down.
@@ -234,4 +348,13 @@ mod tests {
             let _ = partition_label(s);
         }
     }
+}
+
+/// What a commit actually did, for the message line.
+#[derive(Debug, Clone)]
+pub struct CommitOutcome {
+    pub sectors: usize,
+    pub bytes: usize,
+    pub edits: usize,
+    pub journal: PathBuf,
 }

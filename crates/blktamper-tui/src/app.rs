@@ -4,6 +4,7 @@ use crate::clip::Clipboard;
 use crate::rows::{self, Expansion, Filter, RowSet};
 use crate::session::Session;
 use blktamper_core::render::{copy_hexdump, copy_labelled, copy_tsv, copy_value, fmt_offset};
+use blktamper_core::scrub::{Fill, ScrubPlan};
 use blktamper_core::{FormatId, Node, RenderCtx};
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
@@ -13,7 +14,7 @@ pub enum Focus {
     Table,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug)]
 pub enum Popup {
     None,
     Help,
@@ -21,6 +22,10 @@ pub enum Popup {
     /// Offer the formats that scored above zero at an offset.
     Interpret { at: u64, options: Vec<(FormatId, String, u8)>, sel: usize },
     Command { buffer: String },
+    /// Describing an unapplied scrub. Nothing is staged until Enter.
+    Scrub { plan: Box<ScrubPlan> },
+    /// The last gate. The device name has to be typed out.
+    Commit { typed: String },
 }
 
 /// Where we came from, so a 40 GB jump is reversible (R-5.3).
@@ -49,6 +54,35 @@ pub struct App {
     pub wide: bool,
     /// Pending multi-key sequence, e.g. `y` waiting for its second key.
     pub pending: Option<char>,
+}
+
+/// UTC timestamp for journal filenames, without taking a date dependency.
+///
+/// Howard Hinnant's civil-from-days, which is the standard way to do this and short
+/// enough not to be worth a crate.
+pub fn utc_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let days = secs.div_euclid(86_400);
+    let rem = secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = if m <= 2 { y + 1 } else { y };
+    format!(
+        "{y:04}-{m:02}-{d:02}T{:02}-{:02}-{:02}",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 impl std::fmt::Debug for App {
@@ -275,6 +309,71 @@ impl App {
         self.row = j.row.min(self.rowset.rows.len().saturating_sub(1));
     }
 
+    /// Offer to scrub the selected record, if the format is willing.
+    ///
+    /// `scrub_plan` returning `Some` *is* the predicate for "this is a recoverable
+    /// record". No label matching: FAT and exFAT word their labels differently and a
+    /// UI that decided by string would be wrong the first time one was reworded.
+    fn scrub(&mut self) {
+        if !self.has_regions() {
+            return;
+        }
+        let Some(row) = self.rowset.rows.get(self.row).cloned() else { return };
+        let root = self.session.regions[self.region].root_mut().clone();
+        let Some(node) = rows::node_at(&root, &row.index_path).cloned() else { return };
+
+        match self.session.regions[self.region].reader.scrub_plan(&node, Fill::Neutral) {
+            Some(plan) => self.popup = Popup::Scrub { plan: Box::new(plan) },
+            None => {
+                self.message =
+                    "not a recoverable record: scrubbing is for deleted entries, and it \
+                     takes a whole record set rather than one field"
+                        .into()
+            }
+        }
+    }
+
+    /// Re-plan the currently-offered scrub with a different fill.
+    fn rescrub(&mut self, fill: Fill) {
+        let Popup::Scrub { plan } = &self.popup else { return };
+        if fill == Fill::Zero && !plan.zero_available() {
+            self.message = plan
+                .zero_refusal
+                .as_ref()
+                .map(|r| r.message())
+                .unwrap_or_else(|| "zeroing is not available here".into());
+            return;
+        }
+        let label = plan.label.clone();
+        let root = self.session.regions[self.region].root_mut().clone();
+        let Some(row) = self.rowset.rows.get(self.row).cloned() else { return };
+        let Some(node) = rows::node_at(&root, &row.index_path).cloned() else { return };
+        let _ = label;
+        if let Some(p) = self.session.regions[self.region].reader.scrub_plan(&node, fill) {
+            self.popup = Popup::Scrub { plan: Box::new(p) };
+        }
+    }
+
+    fn stage_scrub(&mut self) {
+        let Popup::Scrub { plan } = std::mem::replace(&mut self.popup, Popup::None) else { return };
+        let path = self.selected_path();
+        match self.session.stage(plan.edits.clone(), &path) {
+            Ok(()) => {
+                self.message = format!(
+                    "staged: {} record(s), {} bytes. Nothing is on the device yet — :diff to \
+                     review, :commit to write, :revert to discard.",
+                    plan.records(),
+                    plan.bytes_changed()
+                );
+                for r in &mut self.session.regions {
+                    r.root = None; // re-parse so the change is visible immediately
+                }
+                self.rebuild();
+            }
+            Err(e) => self.message = format!("could not stage: {e}"),
+        }
+    }
+
     fn yank(&mut self, kind: char) {
         if !self.has_regions() || self.rowset.rows.is_empty() {
             self.message = "nothing selected to copy".into();
@@ -337,7 +436,68 @@ impl App {
         let cmd = cmd.trim();
         let (head, rest) = cmd.split_once(' ').unwrap_or((cmd, ""));
         match head {
-            "q" | "quit" => self.should_quit = true,
+            "q" | "quit" => {
+                if self.session.overlay.is_dirty() {
+                    self.message = format!(
+                        "{} staged edit(s) would be discarded; :revert first, or :q! to quit anyway",
+                        self.session.overlay.staged().len()
+                    );
+                } else {
+                    self.should_quit = true;
+                }
+            }
+            "q!" | "quit!" => self.should_quit = true,
+            "arm" => match self.session.arm() {
+                Ok(()) => {
+                    self.message = if self.session.info.is_mounted() {
+                        format!(
+                            "ARMED for {} — and it has MOUNTED filesystems. Writing to a \
+                             mounted volume's metadata is how you corrupt it or panic the \
+                             kernel. Unmount before committing.",
+                            self.session.info.path.display()
+                        )
+                    } else {
+                        format!("ARMED for {}", self.session.info.path.display())
+                    }
+                }
+                Err(e) => self.message = e,
+            },
+            "disarm" => {
+                self.session.disarm();
+                self.message = "disarmed; the write handle is closed".into();
+            }
+            "diff" => {
+                let staged = self.session.overlay.staged();
+                self.message = if staged.is_empty() {
+                    "nothing staged".into()
+                } else {
+                    let sectors = self.session.overlay.sectors_touched(self.session.sector_size as u64);
+                    format!(
+                        "{} staged edit(s), {} bytes, {} sector(s) would be rewritten in full",
+                        staged.len(),
+                        self.session.overlay.bytes_changed(),
+                        sectors.len()
+                    )
+                };
+            }
+            "revert" => {
+                let n = self.session.overlay.staged().len();
+                self.session.overlay.revert();
+                for r in &mut self.session.regions {
+                    r.root = None;
+                }
+                self.rebuild();
+                self.message = format!("discarded {n} staged edit(s); the device was never touched");
+            }
+            "commit" => {
+                if !self.session.write.armed() {
+                    self.message = "not armed: run :arm first (and start with --rw)".into();
+                } else if !self.session.overlay.is_dirty() {
+                    self.message = "nothing staged".into();
+                } else {
+                    self.popup = Popup::Commit { typed: String::new() };
+                }
+            }
             "lba" => match parse_num(rest) {
                 Some(lba) => match lba.checked_mul(self.session.sector_size as u64) {
                     Some(b) => self.goto_byte(b),
@@ -460,6 +620,65 @@ impl App {
                 }
                 return;
             }
+            Popup::Scrub { plan } => {
+                let (zero_ok, refusal) = (plan.zero_available(), plan.zero_refusal.clone());
+                match key.code {
+                    KeyCode::Char('n') => self.rescrub(Fill::Neutral),
+                    KeyCode::Char('z') => {
+                        if zero_ok {
+                            self.rescrub(Fill::Zero)
+                        } else {
+                            self.message = refusal
+                                .map(|r| r.message())
+                                .unwrap_or_else(|| "zeroing is not available here".into());
+                        }
+                    }
+                    KeyCode::Enter => self.stage_scrub(),
+                    KeyCode::Esc | KeyCode::Char('q') => self.popup = Popup::None,
+                    _ => {}
+                }
+                return;
+            }
+            Popup::Commit { typed } => {
+                match key.code {
+                    KeyCode::Char(c) => typed.push(c),
+                    KeyCode::Backspace => {
+                        typed.pop();
+                    }
+                    KeyCode::Esc => self.popup = Popup::None,
+                    KeyCode::Enter => {
+                        let want = self
+                            .session
+                            .info
+                            .path
+                            .file_name()
+                            .map(|s| s.to_string_lossy().to_string())
+                            .unwrap_or_default();
+                        if typed.trim() != want {
+                            self.message =
+                                format!("type \"{want}\" exactly to confirm, or Esc to cancel");
+                            return;
+                        }
+                        self.popup = Popup::None;
+                        match self.session.commit(&utc_stamp()) {
+                            Ok(o) => {
+                                self.rebuild();
+                                self.message = format!(
+                                    "committed {} edit(s), {} bytes, {} sector(s). Originals \
+                                     journalled to {}",
+                                    o.edits,
+                                    o.bytes,
+                                    o.sectors,
+                                    o.journal.display()
+                                );
+                            }
+                            Err(e) => self.message = format!("commit failed: {e}"),
+                        }
+                    }
+                    _ => {}
+                }
+                return;
+            }
             Popup::None => {}
         }
 
@@ -519,6 +738,7 @@ impl App {
                 self.message =
                     format!("gaps {}", if self.show_gaps { "shown" } else { "hidden" });
             }
+            KeyCode::Char('S') => self.scrub(),
             KeyCode::Char('H') => self.hex_visible = !self.hex_visible,
             KeyCode::Char('w') => self.wide = !self.wide,
 

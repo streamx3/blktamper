@@ -127,18 +127,28 @@ every field, and jump to its data.
 
 ## M6 — Writing
 
-Only now, and only because M0–M5 made it cheap.
+Only now, and only because M0–M5 made it cheap. Ordered so that the *bounded*
+operation comes before the arbitrary one: scrubbing a deleted record touches a set of
+byte ranges the model has already computed, whereas field editing can touch anything.
+Proving the write path on the safer operation first is worth the reordering.
 
-- `Overlay` in the read stack; edited bytes marked; checksums recompute live.
-- `:save` / `:load` region dump and restore (**do this first**).
-- Typed field editor with enum picker; raw hex editor.
-- `:diff`, `:revert`, `:arm`, `:commit` with the sector list and typed confirmation.
-- Off-device journal, `--undo`.
-- `:recompute` for CRCs and mirrors.
-- Write tests run against image files only, never a device.
+1. `Overlay` in the read stack; edited bytes marked; checksums recompute live.
+2. `:save` / `:load` region dump and restore — the blunt instrument, and the one you
+   actually want at 2 a.m.
+3. Off-device journal, `:arm`, `:commit` with the sector list and typed confirmation.
+4. **Scrub a deleted record** — `neutral` and `zero` fills, the end-of-directory
+   guard, whole-set scrubbing. See [ADR-011](03-decisions.md) and
+   [07-write-safety.md](07-write-safety.md#scrubbing-deleted-records).
+5. Typed field editor with enum picker; raw hex editor.
+6. `:recompute` for CRCs and mirrors, deepest-first through the cascade.
+7. `--undo` replaying a journal backwards.
 
-**Exit:** flip an MBR partition type on a loop-mounted image, commit, verify with
-`fdisk -l`, then undo from the journal and verify it's back.
+Write tests run against image files only, never a device.
+
+**Exit:** delete a file with `mdel` on a fixture, scrub its record with `neutral`,
+commit, and confirm with `mdir` that the live files are untouched and with
+blktamper that the name, timestamps and first cluster are gone while the `0xE5`
+tombstone remains. Then undo from the journal and verify the record is back.
 
 ---
 

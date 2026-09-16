@@ -523,3 +523,102 @@ Two consequences worth stating plainly:
 - **Dropping MTD means `BlockSource` has no out-of-band channel.** Adding jffs2 or
   SPIFFS later needs spare-area access and an erase-block concept, and retrofitting
   that is a breaking change to the core trait. Accepted deliberately.
+
+---
+
+## ADR-011: Scrubbing deleted records — two fills, no random
+
+**Status:** accepted — decided by the author 2026-09-16
+
+### Decision
+
+blktamper will be able to overwrite a deleted directory record. Two fills, and
+random is not one of them:
+
+| Mode | What it writes | When it is offered |
+|---|---|---|
+| **neutral** | keeps the record's deleted marker, zeroes the other 31 bytes | always — cannot change directory semantics |
+| **zero** | all 32 bytes to `0x00` | only when no in-use record follows in that directory |
+
+### Why random fill was rejected
+
+It was offered and turned down, and the reasoning is worth keeping because it is
+counter-intuitive: **random bytes are more conspicuous than zeros, not less.**
+
+A directory cluster that a formatter has never used is zeros. Writing noise into one
+announces that somebody deliberately scrubbed there; writing zeros makes the record
+indistinguishable from space that was never allocated. And there is no multi-pass
+argument to make here — a directory record is 32 bytes inside one sector, and one
+pass either landed or it did not.
+
+Random fill also costs a CSPRNG dependency and a class of mistake (seeding a PRNG and
+producing predictable "noise") for no benefit.
+
+### The guard on `zero`, and why it is not optional
+
+In FAT, a first name byte of `0x00` does not mean "this record is empty". It means
+**stop scanning — nothing after this point is in use** (`desc::FREE_MARK`, which
+blktamper already renders as an `end of directory` node). exFAT is identical:
+`entry_type == 0x00` is `types::END_OF_DIRECTORY`.
+
+So zeroing a deleted record that sits before live entries makes every one of those
+live files invisible to every driver. A cleanup operation causing data loss is the
+worst failure this program could have, so:
+
+- `zero` is offered only when every record after it in that directory is already
+  free. Otherwise the tool refuses and explains, and offers `neutral` instead.
+- When records that follow are *deleted* rather than free, `zero` is still allowed —
+  but the confirmation says plainly that it will also make those unreachable to a
+  driver. Their bytes are untouched and blktamper will still show them; "hidden" and
+  "destroyed" are different claims and the UI may not blur them.
+
+`neutral` has no such hazard, which is why it is the default.
+
+### What "neutral" writes, exactly
+
+| Format | Byte 0 | Bytes 1..32 |
+|---|---|---|
+| FAT 8.3 entry | `0xE5` (unchanged) | zero |
+| FAT long-filename entry | `0xE5` (unchanged) | zero — including `attr`, so the record stops advertising itself as a name fragment |
+| exFAT file / stream / name entry | the InUse-cleared type byte (`0x05` / `0x40` / `0x41`, unchanged) | zero |
+
+The whole record set is scrubbed together — every long-filename fragment, or the
+exFAT primary plus its stream extension plus every name entry. Scrubbing half a set
+would leave a name recoverable from the other half, which is the failure this feature
+exists to prevent.
+
+### Scope: records, not file contents
+
+**blktamper scrubs metadata. It does not overwrite file data.** That is
+[`sanitize`](https://github.com/streamx3/sanitize)'s job, and the two tools divide
+cleanly:
+
+- `sanitize` overwrites the file's contents through the filesystem.
+- `blktamper` shows what survived that, and can scrub the metadata residue the
+  filesystem left behind — the directory record, the long filename, the timestamps,
+  the first cluster.
+
+There is also a practical reason blktamper *cannot* do much better on data: the
+delete has already released the cluster chain, so only the **first** cluster of a
+deleted file is still known. The rest is not reachable from the metadata, which is
+precisely what blktamper reports today ("the FAT entry for cluster 495 reads free:
+the chain was released by the delete"). A tool that offered to "scrub the file data"
+while only being able to reach the first cluster would be lying.
+
+### Scope: logical, not physical
+
+Out of scope, by decision:
+
+- Whether overwriting a logical sector overwrites the physical cell. On flash it
+  generally does not — the FTL, wear levelling and over-provisioning see to that.
+- Whether the filesystem or the device redirects, journals or snapshots the write.
+
+The position taken is that this is the user's problem to solve at a different layer:
+use an encrypted container from the start, or destroy the device. A tool that
+pretended to guarantee physical erasure through a filesystem interface would be
+making a promise it cannot keep — which is exactly the honesty `sanitize` already
+shows about itself.
+
+blktamper still *reports* what it knows: `blktamper-io` reads `rotational` from
+sysfs, so the commit screen can say "this is a solid-state device; an overwrite here
+changes the mapping, not necessarily the cell" without claiming to fix it.

@@ -253,6 +253,86 @@ Only the last mile: the dependency ordering (`ChecksumSpec` already carries enou
 derive it), the overlay to stage into, and the commit path. The arithmetic, the
 coverage rules, the exclusions and the proposed-edit generation are done and tested.
 
+## Scrubbing deleted records
+
+The first write operation blktamper will grow, and deliberately so: it is the use
+case that motivated the program ([ADR-009](03-decisions.md)), and it is a *bounded*
+target — the model already knows exactly which bytes to touch — which makes it the
+safest possible way to prove the whole write path works. Decisions in
+[ADR-011](03-decisions.md).
+
+### Why the target is already solved
+
+A deleted file is not one record. On FAT it is N long-filename fragments stored in
+reverse order immediately before the 8.3 entry; on exFAT it is a file entry plus a
+stream extension plus N name entries. The reader already groups these into one node
+whose `Extent::Many` lists every 32-byte span, so "which bytes does this record
+occupy" needs no new code — that was the hard part and `Extent::Many` existing from
+day one (rather than being retrofitted) is what paid for it.
+
+### The four hazards
+
+**1. Zeroing byte 0 truncates the directory.** `0x00` in a FAT name's first byte, or
+in an exFAT `entry_type`, means *stop scanning* — not *this record is empty*. Zeroing
+a record that sits before live entries hides every one of them from every driver.
+Guarded: `zero` is offered only when nothing in use follows. See ADR-011.
+
+**2. The record shares a sector with live files.** A 32-byte write is physically a
+read-modify-write of 512 or 4096 bytes, and a 512-byte sector holds sixteen directory
+records. Scrubbing one deleted entry rewrites up to fifteen live ones. The overlay
+preserves them by construction — which is the argument for building the overlay
+properly rather than reaching for a targeted `pwrite`.
+
+**3. The set must be scrubbed whole.** Clearing the 8.3 entry while leaving its
+long-filename fragments leaves the name fully recoverable, and that is the exact
+failure this feature exists to prevent. The command operates on the group, never on
+one record inside it.
+
+**4. Scrubbing the record does not scrub the file.** The entry points at a first
+cluster; the data is elsewhere and untouched, and the delete already released the
+chain so only that first cluster is even knowable. The command removes the *name*,
+not the *content*, and the UI has to say so rather than leaving the user to assume
+otherwise. Overwriting contents is `sanitize`'s job.
+
+### What it will look like
+
+```
+     +- scrub deleted record ----------------------------------------------+
+     | Record     ?ECRET.TXT (deleted)                                     |
+     |            1 short entry + 0 long-filename fragments                |
+     |            32 bytes at 0x00001FC4C0                                 |
+     |                                                                     |
+     | Fill       (o) neutral   keep the 0xE5 marker, zero the other 31 B  |
+     |            ( ) zero      all 32 bytes -- REFUSED HERE:              |
+     |                          3 in-use records follow in this directory  |
+     |                                                                     |
+     | Removes    name, attributes, all three timestamps, size, cluster    |
+     | Keeps      the 0xE5 tombstone: that a file was deleted stays        |
+     |            visible, which file it was does not                      |
+     | Does NOT   touch the file's data. Cluster 495 and whatever follows  |
+     |            it are unchanged -- use sanitize for contents.           |
+     |                                                                     |
+     | Rewrites   sector 4066 in full (512 B), which also holds 15 live    |
+     |            directory records                                        |
+     |                                                                     |
+     | [Enter] stage in overlay   [Esc] cancel                             |
+     +---------------------------------------------------------------------+
+```
+
+Staged, like every other edit. Nothing reaches the device until `:commit`, which
+shows the byte diff, names the sectors, journals the original bytes off-device and
+asks for the device name to be typed.
+
+### What it will not do
+
+- Offer a random or multi-pass fill. Rejected in ADR-011: on a 32-byte record inside
+  one sector, noise is more conspicuous than zeros and multiple passes are theatre.
+- Claim the bytes are physically gone. On flash they very likely are not, and that is
+  out of scope by decision rather than by oversight.
+- Scrub anything the user did not select. There is no "scrub all deleted records"
+  sweep in the first version — it is exactly the operation whose blast radius is
+  hardest to preview, and the preview is the safety feature.
+
 ## What the app will never do
 
 - Escalate privileges on its own.

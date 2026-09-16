@@ -204,3 +204,42 @@ mod tests {
         assert!(!s.read_at(u64::MAX, &mut buf).is_ok());
     }
 }
+
+/// Write access. Deliberately a separate trait from `BlockSource`, so that "this
+/// build cannot write" is a property you can check by looking for implementors
+/// rather than by auditing call sites (ADR-007).
+///
+/// Implementors are expected to be opened for writing explicitly; nothing in this
+/// crate ever turns a `BlockSource` into a `BlockSink`.
+pub trait BlockSink: BlockSource {
+    /// Write `data` at `offset`. Must write all of it or report an error.
+    ///
+    /// Note what this is not: a byte-granular operation. A block device's minimum
+    /// unit is a sector, so writing two bytes is physically a read-modify-write of
+    /// whichever sector holds them, and whatever else lives in that sector is
+    /// rewritten along with them (doc/07-write-safety.md).
+    fn write_at(&self, offset: u64, data: &[u8]) -> Result<(), WriteError>;
+
+    /// Push everything to the device. Returns only once the kernel says so.
+    fn flush(&self) -> Result<(), WriteError>;
+
+    /// Bytes that can be written; a write past this must be refused, not truncated.
+    fn writable_len(&self) -> u64 {
+        self.len()
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum WriteError {
+    #[error("write of {len} bytes at {offset:#x} runs past the end of the device ({device_len} bytes)")]
+    PastEnd { offset: u64, len: usize, device_len: u64 },
+    #[error("the device is open read-only")]
+    ReadOnly,
+    #[error("I/O error writing {len} bytes at {offset:#x}: {source}")]
+    Io {
+        offset: u64,
+        len: usize,
+        #[source]
+        source: std::io::Error,
+    },
+}

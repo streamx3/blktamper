@@ -44,6 +44,21 @@ pub trait RegionReader: Send + Sync {
     fn root(&self) -> Node;
     /// Byte offset this region starts at.
     fn base(&self) -> u64;
+
+    /// Describe overwriting a recoverable record, without writing anything.
+    ///
+    /// `None` means this format has no notion of a scrubbable record, or this node
+    /// is not one — a partition table has nothing recoverable to scrub, so MBR and
+    /// GPT take the default.
+    ///
+    /// The plan is a description: what bytes would change, what information that
+    /// destroys, what survives, and whether `Fill::Zero` is safe here. Applying it is
+    /// the caller's decision and goes through the overlay and an explicit commit
+    /// (ADR-007, ADR-011).
+    fn scrub_plan(&self, node: &Node, fill: crate::scrub::Fill) -> Option<crate::scrub::ScrubPlan> {
+        let _ = (node, fill);
+        None
+    }
 }
 
 #[derive(Default)]

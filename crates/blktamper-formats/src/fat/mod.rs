@@ -20,6 +20,7 @@
 //!   actually work" is asking precisely about that residue.
 
 pub mod desc;
+mod scrub;
 
 use crate::common::{read_exact_opt, u16le, u32le, ChainGuard, Step};
 use blktamper_core::{
@@ -668,6 +669,14 @@ impl FatReader {
 }
 
 impl RegionReader for FatReader {
+    fn scrub_plan(
+        &self,
+        node: &Node,
+        fill: blktamper_core::scrub::Fill,
+    ) -> Option<blktamper_core::scrub::ScrubPlan> {
+        self.plan_scrub(node, fill)
+    }
+
     fn id(&self) -> FormatId {
         ID
     }

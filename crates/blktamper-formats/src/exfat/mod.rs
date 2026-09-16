@@ -20,6 +20,7 @@
 //!   single highest-value thing this module does.
 
 pub mod desc;
+mod scrub;
 pub mod types;
 
 use crate::common::{read_desc_at, u16le, u32le, u64le, ChainGuard, Step};
@@ -329,6 +330,14 @@ impl ExfatReader {
 }
 
 impl RegionReader for ExfatReader {
+    fn scrub_plan(
+        &self,
+        node: &Node,
+        fill: blktamper_core::scrub::Fill,
+    ) -> Option<blktamper_core::scrub::ScrubPlan> {
+        self.plan_scrub(node, fill)
+    }
+
     fn id(&self) -> FormatId {
         ID
     }

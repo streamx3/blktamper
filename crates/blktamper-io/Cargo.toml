@@ -1,0 +1,13 @@
+[package]
+name = "blktamper-io"
+description = "Block device and image file access for blktamper: caching, sector geometry, mount detection"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blktamper-core.workspace = true
+thiserror.workspace = true

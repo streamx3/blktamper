@@ -1,0 +1,22 @@
+[package]
+name = "blktamper-formats"
+description = "On-disk format descriptions for blktamper: MBR, GPT, FAT, exFAT"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+blktamper-core.workspace = true
+
+[dev-dependencies]
+blktamper-io.workspace = true
+
+[features]
+default = ["mbr", "gpt", "fat", "exfat"]
+mbr = []
+gpt = []
+fat = []
+exfat = []

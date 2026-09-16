@@ -1,0 +1,26 @@
+[package]
+name = "blktamper-tui"
+description = "Terminal UI for blktamper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "blktamper"
+path = "src/main.rs"
+
+[dependencies]
+blktamper-core.workspace = true
+blktamper-io.workspace = true
+blktamper-formats.workspace = true
+ratatui = "0.30"
+clap = { version = "4", features = ["derive"] }
+arboard = { version = "3", default-features = false, features = ["wayland-data-control"], optional = true }
+anyhow = "1"
+
+[features]
+default = ["clipboard"]
+clipboard = ["dep:arboard"]

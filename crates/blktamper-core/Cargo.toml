@@ -1,0 +1,12 @@
+[package]
+name = "blktamper-core"
+description = "Provenance-first model for on-disk structures: spans, nodes, field descriptors"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror.workspace = true

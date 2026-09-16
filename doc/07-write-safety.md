@@ -179,7 +179,7 @@ checksum field renders as *stored* alongside *computed*, with a pass/fail marker
 that is useful with no write path at all, and it is already implemented. Recomputing
 for a write is the same code with a byte write on the end.
 
-So the read-only build you have today already:
+So the build you have today already:
 
 - knows the algorithm, the covered byte range, and the excluded bytes for every
   checksum field (`ChecksumSpec` in `blktamper-core/src/checksum.rs`);
@@ -294,7 +294,7 @@ chain so only that first cluster is even knowable. The command removes the *name
 not the *content*, and the UI has to say so rather than leaving the user to assume
 otherwise. Overwriting contents is `sanitize`'s job.
 
-### What it will look like
+### What it looks like (implemented in 0.1.1)
 
 ```
      +- scrub deleted record ----------------------------------------------+
@@ -320,8 +320,13 @@ otherwise. Overwriting contents is `sanitize`'s job.
 ```
 
 Staged, like every other edit. Nothing reaches the device until `:commit`, which
-shows the byte diff, names the sectors, journals the original bytes off-device and
-asks for the device name to be typed.
+names the sectors, journals the original bytes off-device and asks for the device
+name to be typed.
+
+The refusal shown above is real: `zero` is offered only when the reader has walked
+the rest of the directory and found nothing in use. When it cannot finish that walk —
+an unreadable sector, an unusable geometry — it also refuses, because an unverifiable
+guarantee is not one.
 
 ### What it will not do
 

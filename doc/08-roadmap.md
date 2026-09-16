@@ -10,13 +10,16 @@
 | M3 GPT | **done** — both headers, both entry arrays, both CRCs, primary/backup diff, ~40 type GUIDs, protective/hybrid MBR handling |
 | M4 FAT32 headers | **done** — BPB, EBPB32, EBPB16, FSInfo, derived geometry, FAT mirror comparison |
 | M5 FAT32 directories | **done** — cluster chains, LFN assembly with checksum, deleted entries and orphaned fragments surfaced |
-| M6 writing | **not started, deliberately** — read-only build |
+| M6 writing | **partly done** — overlay, journal, arm/commit and record scrubbing for FAT and exFAT are in. Field editing, `:save`/`:load`, `:recompute` and `--undo` are not. |
 | M7 exFAT | verification in progress |
 
-The build is **read-only**: `blktamper-io` has no write path at all, and devices are
-opened `O_RDONLY`. Checksum *verification* is implemented; checksum *recomputation* is
-designed and half-built (see [07-write-safety.md](07-write-safety.md)) but stages
-nothing, because there is nothing to stage into yet.
+The build can write, behind the three gates of [ADR-007](03-decisions.md): devices
+open `O_RDONLY`, `--rw` permits arming, `:arm` opens the write handle, and `:commit`
+needs the device name typed. `scripts/check.sh` verifies all of that as build
+failures rather than as review habits.
+
+The only write operation is scrubbing a recoverable record. Checksum *verification*
+is implemented; `:recompute` now has an overlay to stage into but is not yet wired.
 
 
 Milestones are defined by **exit criteria**, not by time. Each one should end with
@@ -132,16 +135,20 @@ operation comes before the arbitrary one: scrubbing a deleted record touches a s
 byte ranges the model has already computed, whereas field editing can touch anything.
 Proving the write path on the safer operation first is worth the reordering.
 
-1. `Overlay` in the read stack; edited bytes marked; checksums recompute live.
-2. `:save` / `:load` region dump and restore — the blunt instrument, and the one you
-   actually want at 2 a.m.
-3. Off-device journal, `:arm`, `:commit` with the sector list and typed confirmation.
-4. **Scrub a deleted record** — `neutral` and `zero` fills, the end-of-directory
-   guard, whole-set scrubbing. See [ADR-011](03-decisions.md) and
+1. ~~`Overlay` in the read stack~~ **done** — reads see staged edits, so the tree
+   re-parses against them before anything touches the device.
+2. ~~Off-device journal, `:arm`, `:commit` with the sector list and typed
+   confirmation~~ **done**.
+3. ~~**Scrub a deleted record**~~ **done** for FAT12/16/32 and exFAT — `neutral` and
+   `zero` fills, the end-of-directory guard, whole-set staging. See
+   [ADR-011](03-decisions.md) and
    [07-write-safety.md](07-write-safety.md#scrubbing-deleted-records).
+4. `:save` / `:load` region dump and restore — the blunt instrument, and the one you
+   actually want at 2 a.m.
 5. Typed field editor with enum picker; raw hex editor.
 6. `:recompute` for CRCs and mirrors, deepest-first through the cascade.
-7. `--undo` replaying a journal backwards.
+7. `--undo` replaying a journal backwards. The journal already round-trips into its
+   own undo edits; only the CLI entry point is missing.
 
 Write tests run against image files only, never a device.
 

@@ -9,9 +9,11 @@ Deleted directory entries, orphaned long-filename fragments, unused-but-not-zero
 partition slots and unclaimed bytes are shown by default and marked, rather than
 hidden the way a filesystem driver would hide them.
 
-> **This build is read-only.** It opens devices `O_RDONLY` and has no write path.
-> The name is aspirational. Do not point a future write-capable build at data you
-> are afraid to lose.
+> **It can write, behind three gates.** Devices open read-only; `--rw` permits
+> arming; `:arm` opens the write handle; `:commit` needs the device name typed.
+> Without `--rw` the process never opens a writable descriptor at all. The one write
+> operation it has is scrubbing a deleted record — see below. Do not point it at data
+> you are afraid to lose.
 
 ## Try it
 
@@ -50,6 +52,52 @@ cargo run -p blktamper-tui -- disk.img --dump --depth 3
 299 tests, clippy clean, no `unsafe`. `./scripts/check.sh` runs everything CI would,
 including the layering rules from [ADR-006](doc/03-decisions.md) — `blktamper-core`
 must not pull in a terminal, and each format must build and test on its own.
+
+## Scrubbing deleted records
+
+The one thing it writes, and the reason it exists. Select a recoverable record and
+press `S`:
+
+```
+ Record     deleted-payload.bin (deleted)
+            3 record(s), 96 bytes at 0x00001FC840
+
+ Fill       (o) neutral   keep the deleted marker, zero the rest
+            ( ) zero      zero every byte; reads as never used
+
+ Removes    the long filename, held in 2 fragment(s) that survived the
+              delete intact
+            the 8.3 name, less its already-destroyed first character
+            the attribute byte
+            the creation, last-access and last-write timestamps
+            the recorded size, 50000 bytes
+            the first cluster, 496
+ Keeps      the 0xE5 marker on each record: that a file was deleted here
+              stays visible, which file it was does not
+            the file's data clusters, which this command does not reach
+
+ !          this does not touch the file's data. Cluster 496 at 0x000023A000
+            and whatever followed it are unchanged.
+
+ Rewrites   1 sector(s) of 512 B, in full; 60 of 512 bytes actually change,
+            and every other record in them is preserved
+```
+
+Three things that dialog is careful about:
+
+- **`zero` is guarded.** `0x00` in a FAT name's first byte, or an exFAT `entry_type`,
+  means *stop scanning* — not *this record is empty*. Zeroing a record ahead of live
+  entries hides them from every driver, so it is offered only when nothing in use
+  follows.
+- **The set goes together.** A FAT record is its 8.3 entry plus every long-filename
+  fragment; exFAT is the file entry plus the stream extension plus every name entry.
+  Half a scrub leaves the name recoverable from the other half.
+- **It scrubs the name, not the file.** Overwriting contents is
+  [`sanitize`](https://github.com/streamx3/sanitize)'s job — and the delete already
+  released the cluster chain, so only the first cluster is even knowable here.
+
+Nothing reaches the device until `:commit`, which journals the original bytes
+off-device first. `blktamper --undo <journal>` is next.
 
 ## Layout
 

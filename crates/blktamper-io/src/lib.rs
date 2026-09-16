@@ -14,11 +14,15 @@ pub mod cache;
 pub mod file;
 #[cfg(target_os = "linux")]
 pub mod linux;
+pub mod journal;
 pub mod open;
+pub mod overlay;
 
 pub use cache::CachedSource;
-pub use file::FileSource;
+pub use file::{FileSink, FileSource};
+pub use journal::{Journal, JournalError};
 pub use open::{open_path, Access, DeviceInfo, OpenError};
+pub use overlay::{Overlay, StageError, Staged};
 
 /// What kind of thing we are looking at.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

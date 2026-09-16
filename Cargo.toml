@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/blktamper-core",
+    "crates/blktamper-io",
+    "crates/blktamper-formats",
+    "crates/blktamper-tui",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+authors = ["Andrii Shelestov"]
+repository = "https://github.com/streamx3/blktamper"
+rust-version = "1.82"
+
+[workspace.dependencies]
+blktamper-core = { path = "crates/blktamper-core", version = "0.1.0" }
+blktamper-io = { path = "crates/blktamper-io", version = "0.1.0" }
+blktamper-formats = { path = "crates/blktamper-formats", version = "0.1.0" }
+thiserror = "2"
+
+[profile.release]
+# A silently wrapped offset displays the wrong sector with full confidence.
+# See doc/03-decisions.md ADR-008.
+overflow-checks = true
+debug = 1
